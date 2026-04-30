@@ -52,6 +52,7 @@ helm rollback litellm <REVISION_NUMBER> -n litellm
 - PR: [BerriAI/litellm#26627](https://github.com/BerriAI/litellm/pull/26627)
 
 **Hotfix**：在 LiteLLM 未合并并发版前，使用 Helm `command:` override 在容器启动时 patch 库文件。完整 YAML 见第 14 章末尾 "Hotfix: Bedrock ARN models + prompt caching"。
+**何时可以移除**：upstream PR 合入并发布版本后，直接升级到该版本，然后从 values.yaml 里移除 `command:` 块，`helm upgrade` 部署，验证 cache 仍然工作即可。
 
 ## 18.3 App inference profile 显示cost 0 得问题
 
@@ -71,5 +72,3 @@ litellm有个bug 就是如果看到app inference profile, 会认不出这个mode
           base_model: anthropic.claude-opus-4-6-v1
           id: claude-opus-4-6-team-c-app
 ```
-
-**何时可以移除**：upstream PR 合入并发布版本后，直接升级到该版本，然后从 values.yaml 里移除 `command:` 块，`helm upgrade` 部署，验证 cache 仍然工作即可。
