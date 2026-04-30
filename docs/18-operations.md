@@ -53,4 +53,23 @@ helm rollback litellm <REVISION_NUMBER> -n litellm
 
 **Hotfix**：在 LiteLLM 未合并并发版前，使用 Helm `command:` override 在容器启动时 patch 库文件。完整 YAML 见第 14 章末尾 "Hotfix: Bedrock ARN models + prompt caching"。
 
+## 18.3 App inference profile 显示cost 0 得问题
+
+litellm有个bug 就是如果看到app inference profile, 会认不出这个model， 所以需要手动设置base_model这样cost就能显示出来
+
+```bash
+- model_name: claude-opus-4-6-team-c
+        litellm_params:
+          aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID
+          aws_region_name: us-east-1
+          aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY
+          max_parallel_requests: 3
+          model: bedrock/converse/arn:aws:bedrock:us-east-1:476114114317:application-inference-profile/slyg9mj0honl
+          rpm: 10
+          tpm: 50000
+        model_info:
+          base_model: anthropic.claude-opus-4-6-v1
+          id: claude-opus-4-6-team-c-app
+```
+
 **何时可以移除**：upstream PR 合入并发布版本后，直接升级到该版本，然后从 values.yaml 里移除 `command:` 块，`helm upgrade` 部署，验证 cache 仍然工作即可。
