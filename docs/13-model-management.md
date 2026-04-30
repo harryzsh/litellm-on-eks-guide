@@ -72,6 +72,15 @@ proxy_config:
       litellm_params:
         model: "bedrock/anthropic.claude-3-haiku-20240307-v1:0"
         aws_region_name: "us-east-1"
+    - model_name: claude-opus-4-6-team-c
+        litellm_params:
+          aws_region_name: us-east-1
+          max_parallel_requests: 3
+          model: bedrock/converse/arn:aws:bedrock:us-east-1:476114114317:application-inference-profile/id
+          rpm: 10
+          tpm: 50000
+        model_info:
+          base_model: anthropic.claude-opus-4-6-v1
 ```
 
 ```
