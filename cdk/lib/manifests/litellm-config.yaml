@@ -185,8 +185,6 @@ router_settings:
   optional_pre_call_checks: ["prompt_caching"]
   allowed_fails: 3
   cooldown_time: 30
-  model_group_alias:
-    claude-haiku-4-5: claude-haiku-4-5-20251001
 
 litellm_settings:
   drop_params: true
