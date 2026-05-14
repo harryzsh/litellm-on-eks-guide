@@ -1,0 +1,219 @@
+# ============================================================
+# LiteLLM Proxy Config - Bedrock-only routing
+# Original source: litellm-best-practice k8s/02-configmap.yaml
+# ============================================================
+
+model_list:
+  # ==== Claude Opus 4.7 (AKSK_1) ====
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: bedrock/global.anthropic.claude-opus-4-7
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
+      aws_region_name: us-east-1
+    model_info:
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.000025
+      cache_read_input_token_cost: 0.0000005
+      cache_creation_input_token_cost: 0.00000625
+      cache_creation_input_token_cost_above_1hr: 0.00001
+
+  # ==== Claude Opus 4.7 (AKSK_2) — load balanced ====
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: bedrock/global.anthropic.claude-opus-4-7
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_2
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_2
+      aws_region_name: us-east-1
+    model_info:
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.000025
+      cache_read_input_token_cost: 0.0000005
+      cache_creation_input_token_cost: 0.00000625
+      cache_creation_input_token_cost_above_1hr: 0.00001
+
+  # ==== Claude Opus 4.6 (AKSK_1) ====
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: bedrock/global.anthropic.claude-opus-4-6-v1
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
+      aws_region_name: us-east-1
+    model_info:
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.000025
+      cache_read_input_token_cost: 0.0000005
+      cache_creation_input_token_cost: 0.00000625
+      cache_creation_input_token_cost_above_1hr: 0.00001
+
+  # ==== Claude Opus 4.6 (AKSK_2) — load balanced ====
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: bedrock/global.anthropic.claude-opus-4-6-v1
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_2
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_2
+      aws_region_name: us-east-1
+    model_info:
+      input_cost_per_token: 0.000005
+      output_cost_per_token: 0.000025
+      cache_read_input_token_cost: 0.0000005
+      cache_creation_input_token_cost: 0.00000625
+      cache_creation_input_token_cost_above_1hr: 0.00001
+
+  # ==== Claude Sonnet 4.6 (AKSK_1) ====
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: bedrock/global.anthropic.claude-sonnet-4-6
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
+      aws_region_name: us-east-1
+    model_info:
+      max_input_tokens: 1000000
+      input_cost_per_token: 0.000003
+      output_cost_per_token: 0.000015
+      cache_read_input_token_cost: 0.0000003
+      cache_creation_input_token_cost: 0.00000375
+      cache_creation_input_token_cost_above_1hr: 0.000006
+
+  # ==== Claude Sonnet 4.6 (AKSK_2) — load balanced ====
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: bedrock/global.anthropic.claude-sonnet-4-6
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_2
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_2
+      aws_region_name: us-east-1
+    model_info:
+      max_input_tokens: 1000000
+      input_cost_per_token: 0.000003
+      output_cost_per_token: 0.000015
+      cache_read_input_token_cost: 0.0000003
+      cache_creation_input_token_cost: 0.00000375
+      cache_creation_input_token_cost_above_1hr: 0.000006
+
+  # ==== Claude Haiku 4.5 (AKSK_1) ====
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
+      aws_region_name: us-east-1
+    model_info:
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
+      cache_read_input_token_cost: 0.0000001
+      cache_creation_input_token_cost: 0.00000125
+      cache_creation_input_token_cost_above_1hr: 0.000002
+
+  # ==== Claude Haiku 4.5 (AKSK_2) — load balanced ====
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_2
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_2
+      aws_region_name: us-east-1
+    model_info:
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000005
+      cache_read_input_token_cost: 0.0000001
+      cache_creation_input_token_cost: 0.00000125
+      cache_creation_input_token_cost_above_1hr: 0.000002
+
+  # ==== Amazon Nova 2 Lite (global cross-region, 1M ctx) ====
+  - model_name: nova-2-lite
+    litellm_params:
+      model: bedrock/global.amazon.nova-2-lite-v1:0
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
+      aws_region_name: us-east-1
+
+  # ==== Titan Text Embeddings V2 ====
+  - model_name: titan-embed-v2
+    litellm_params:
+      model: bedrock/amazon.titan-embed-text-v2:0
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
+      aws_region_name: us-east-1
+
+  # ==== Cohere Rerank 3.5 ====
+  - model_name: cohere-rerank-v3-5
+    litellm_params:
+      model: bedrock/arn:aws:bedrock:us-east-1::foundation-model/cohere.rerank-v3-5:0
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
+      aws_region_name: us-east-1
+
+  # ==== MiniMax M2.5 ====
+  - model_name: minimax-m2-5
+    litellm_params:
+      model: bedrock/converse/minimax.minimax-m2.5
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
+      aws_region_name: us-east-1
+
+  # ==== Moonshot Kimi K2.5 ====
+  - model_name: kimi-k2-5
+    litellm_params:
+      model: bedrock/moonshotai.kimi-k2.5
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
+      aws_region_name: us-east-1
+
+  # ==== Qwen3 Next 80B A3B ====
+  - model_name: qwen3-next-80b
+    litellm_params:
+      model: bedrock/qwen.qwen3-next-80b-a3b
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
+      aws_region_name: us-east-1
+
+  # ==== Z.AI GLM 5 ====
+  - model_name: glm-5
+    litellm_params:
+      model: bedrock/converse/zai.glm-5
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
+      aws_region_name: us-east-1
+
+router_settings:
+  routing_strategy: simple-shuffle
+  redis_host: os.environ/REDIS_HOST
+  redis_password: os.environ/REDIS_PASSWORD
+  redis_port: os.environ/REDIS_PORT
+  num_retries: 3
+  timeout: 600
+  enable_pre_call_checks: true
+  optional_pre_call_checks: ["prompt_caching"]
+  allowed_fails: 3
+  cooldown_time: 30
+  model_group_alias:
+    claude-haiku-4-5: claude-haiku-4-5-20251001
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  num_retries: 3
+  request_timeout: 600
+  json_logs: true
+
+  fallbacks:
+    - {"claude-opus-4-7": ["claude-opus-4-6"]}
+    - {"claude-opus-4-6": ["claude-sonnet-4-6"]}
+    - {"claude-sonnet-4-6": ["claude-haiku-4-5-20251001"]}
+
+  cache: true
+  cache_params:
+    type: redis
+    host: os.environ/REDIS_HOST
+    port: os.environ/REDIS_PORT
+    password: os.environ/REDIS_PASSWORD
+    supported_call_types: []
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  proxy_batch_write_at: 60
+  database_connection_pool_limit: 10
+  database_connection_timeout: 60
+  disable_error_logs: true
+  allow_requests_on_db_unavailable: true
+  health_check_details: false
