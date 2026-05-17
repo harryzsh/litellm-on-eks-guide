@@ -103,13 +103,13 @@ const mng = cluster.addNodegroupCapacity('SystemNodegroup', {
 | `capacityType` | `ON_DEMAND` | system 组件不能被 spot 中断 ——controller 挂掉直接影响整个集群 |
 | `subnets` | `PRIVATE_WITH_EGRESS` | system pod 不需要直接被外部访问，私有子网更安全 |
 | **`taints: CriticalAddonsOnly:NoSchedule`** | — | **核心隔离机制**：让业务 pod 不能调度过来 |
-| `tags['auto-delete']: 'no'` | — | 防 SpringClean / 资源清理工具误删（详见 §19.3 ASG 标签传播） |
+| `tags['auto-delete']: 'no'` | — | 防资源清理工具误删（详见 §19.3 ASG 标签传播） |
 
 为什么不用 `t4g.medium`（Graviton 版本）省钱？因为 system pod（Karpenter
 controller、aws-lbc 等）**容器镜像不一定支持 arm64**，需要逐个验证；t3.medium
 是无脑安全选择。
 
-## 19.3 ASG 标签传播（防误删的隐藏陷阱）
+## 19.3 ASG 标签传播
 
 EKS Managed Node Group 的 tags **不会自动传播到底层 Auto Scaling Group / EC2 实例**。
 也就是说：
@@ -119,11 +119,7 @@ MNG Tags:                ASG Tags:               EC2 Tags:
 auto-delete=no       →   (空)               →    (空)
 ```
 
-这看起来没事，但出过事故：
-
-> **Incident 2026-05-14**：内部 SpringClean 工具按 `auto-delete` 标签清理资源，
-> 看 EC2 实例上没标签 → 判定为"未保护" → 关停了 system 节点 → karpenter
-> controller 死 → 整个集群伸缩崩溃。
+这看起来没事，但如果你有按标签做资源筛选/保护的下游工具（资源清理脚本、成本归属、合规检查等），它们看到 ASG 和 EC2 上没标签 → 可能误判为"未保护资源"。
 
 **修复方式**：用 AWS Custom Resource 在 ASG 层设标签，并设
 `PropagateAtLaunch: true`：
@@ -155,7 +151,7 @@ new AwsCustomResource(this, 'WriteAsgPropagatedTag', {
 - ASG 自身有这个 tag
 - ASG 启动的每个 EC2 实例**也会有**这个 tag
 
-→ SpringClean 在任何层（MNG / ASG / EC2）查 `auto-delete=no` 都能命中。
+→ 任何按 tag 查询资源的工具，在 MNG / ASG / EC2 任意一层都能命中。
 
 ## 19.4 EKS 集群本身的关键配置
 
@@ -390,7 +386,7 @@ securityGroupSelectorTerms: [{ tags: { karpenter.sh/discovery: <cluster-name> } 
 
 Karpenter 会把这些 tag 自动加到它创建的所有 EC2 实例上：
 - `karpenter.sh/discovery`: 自动发现（让其它工具识别这是 Karpenter 节点）
-- `auto-delete: no`: 跟 §19.3 同样的目的，防 SpringClean 误删 Karpenter 节点
+- `auto-delete: no`: 跟 §19.3 同样的目的，防资源清理工具误删 Karpenter 节点
 
 ## 19.7 NodePool — Karpenter 在什么约束下选节点
 
