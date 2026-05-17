@@ -295,7 +295,7 @@ const karpenterChart = cluster.addHelmChart('Karpenter', {
 
 | 字段 | 值 | 为什么 |
 |---|---|---|
-| `version: 1.5.0` | Karpenter v1.5.0 | 兼容 EKS 1.28-1.33。**注意：当前我们集群已升 1.34**，参见 §19.10 |
+| `version: 1.5.0` | Karpenter v1.5.0 | 兼容 EKS 1.28-1.33。**注意：当前我们集群已升 1.34**，参见 §19.11 |
 | `settings.interruptionQueue: ''` | 空 | Spot 中断处理需要 SQS queue + EventBridge 规则；我们没用 spot 所以省了。等加 spot 时要补 |
 | `serviceAccount.create: false` | — | SA 已经由 CDK 创建（带 IRSA role 注解）；让 Helm 创建会覆盖掉 IRSA |
 | `controller.resources` | req 200m/512Mi, lim 1/1Gi | controller pod 在 idle 时只用 ~50m/100Mi，留 buffer 应对集群伸缩繁忙时 |
@@ -534,7 +534,317 @@ spec:
 → HPA 即使只是 2 副本，Karpenter 也会**起 2 台节点**（每 AZ 一台），
 保证 AZ 全挂时仍有可用 pod。
 
-## 19.9 资源/资源使用观测命令
+## 19.9 高可用性是怎么做到的（保证「N 个 pod 跨 AZ」的 3 道独立保险）
+
+§19.8 解释了 nodeSelector + topologySpread 的基本机制；本节深入：**到底有
+哪些约束在协同工作，让 litellm 永远是「≥ N 个 pod、跨 AZ、跨节点」**？
+
+### 19.9.1 实际现状（先看实测）
+
+```
+litellm-...-qd858  →  m6a.large  ip-10-0-10-217  us-east-1a  ✅
+litellm-...-wnd87  →  m6a.large  ip-10-0-11-80   us-east-1b  ✅
+```
+
+2 个 pod 跨 us-east-1a + us-east-1b。这不是巧合，是 **3 道独立约束叠加** 的
+必然结果。
+
+### 19.9.2 三道保险
+
+#### 保险 1: HPA `minReplicas: 2` —— 副本数下限
+
+```yaml
+# k8s/21-litellm-hpa-pdb.yaml
+spec:
+  minReplicas: 2          # 永远不会缩到 1
+  maxReplicas: 10
+```
+
+- **没有这个**：HPA 在低流量时可能把 replicas 缩到 1 → 单点
+- **有这个**：HPA 算出 desired ≥ 2，Deployment 始终 ≥ 2 个 pod
+
+#### 保险 2: mem request 5Gi —— 数学上单节点装不下 2 pod
+
+```
+m6a.large 节点 allocatable mem:    7.06 GiB    (实测 7,229,880 Ki)
+litellm pod request mem:           5 GiB
+2 pod × 5 GiB = 10 GiB             >  7.06 GiB allocatable
+
+→ scheduler 装箱时, 单台 m6a.large 物理上装不下 2 个 litellm pod
+→ 必须有 ≥ 2 台节点
+```
+
+- **没有这个（比如 mem request 3Gi）**：单节点能装 2 pod (6Gi < 7.06Gi)
+  → scheduler 倾向"把它们堆一起省节点"
+- **有这个**：scheduler 必须等第 2 台节点存在才能放第 2 个 pod
+
+> 这是「经济性手段反向使用」—— 利用 K8s scheduler 的 bin-packing 算法，
+> **故意**把 request 设大到塞不下两个，从而强制 Karpenter 扩节点。
+
+#### 保险 3: topologySpread `DoNotSchedule` —— 强制分散
+
+```yaml
+# k8s/03-deployment.yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule         # 强制跨 AZ
+    labelSelector:
+      matchLabels:
+        app: litellm
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule         # 强制跨节点
+    labelSelector:
+      matchLabels:
+        app: litellm
+```
+
+- **没有这个**：仅靠保险 1+2，2 个 pod 可能都在同一个 AZ 的 2 台节点
+  （满足跨节点但不跨 AZ）
+- **有这个**：scheduler 拒绝这种摆放
+
+### 19.9.3 三道保险的分工
+
+| 想保证的目标 | 单独靠哪道？ |
+|---|---|
+| 副本数 ≥ 2 | 保险 1（HPA minReplicas） |
+| 不堆同节点 | 保险 2（mem 装不下）+ 保险 3（host topologySpread） |
+| 不堆同 AZ | **只能**保险 3（zone topologySpread） |
+| 副本数随负载增长 | 保险 1（HPA scaleUp 到 maxReplicas=10） |
+
+3 个共同协作 = 一定 ≥ 2 节点 + 一定跨 AZ。任何一条都不冗余。
+
+### 19.9.4 maxSkew 到底怎么算
+
+`maxSkew` 是 topologySpreadConstraints 的核心参数。**Skew** 的定义：
+
+```
+skew = max(每个 topology 域的 pod 数) - min(每个 topology 域的 pod 数)
+```
+
+`maxSkew: 1` = "这个差值最多 1，否则违反约束"。
+
+#### 在你的集群跑实例（pods 全部带 `app: litellm` label）
+
+按 `topologyKey: topology.kubernetes.io/zone` 算（domain 是 AZ）：
+
+```
+情况 A: 2 个 pod, 1 个在 1a, 1 个在 1b
+        max=1, min=1
+        skew = 1 - 1 = 0     ✅ ≤ 1  允许 (这是当前状态)
+
+情况 B: 2 个 pod, 都在 1a (1b 是 0)
+        max=2, min=0
+        skew = 2 - 0 = 2     ❌ > 1  禁止 (DoNotSchedule)
+
+情况 C: 3 个 pod, 2 个在 1a, 1 个在 1b
+        max=2, min=1
+        skew = 2 - 1 = 1     ✅ = 1  允许 (临界)
+
+情况 D: 3 个 pod, 全在 1a
+        max=3, min=0
+        skew = 3 - 0 = 3     ❌  禁止
+
+情况 E: 4 个 pod, 2 个在 1a, 2 个在 1b
+        max=2, min=2
+        skew = 2 - 2 = 0     ✅ 完全均匀
+
+情况 F: 4 个 pod, 3 个在 1a, 1 个在 1b
+        max=3, min=1
+        skew = 3 - 1 = 2     ❌  禁止
+```
+
+#### 直觉理解
+
+`maxSkew: 1` ≈ "**任意两个 AZ 的 pod 数差不能超过 1**"
+
+- 它是**软均匀**约束，不是"必须等量"
+- 偶数副本可以完全均匀（2→1+1, 4→2+2）
+- 奇数副本必然差 1（3→2+1, 5→3+2）
+
+### 19.9.5 `whenUnsatisfiable` 的两种行为
+
+当 scheduler 算出来"放这个 pod 的话 skew 会超 maxSkew"时：
+
+| 取值 | 行为 |
+|---|---|
+| `DoNotSchedule` | 不让调度，pod 进 Pending（→ 可能触发 Karpenter 扩节点） |
+| `ScheduleAnyway` | 也"将就"调度上去（不阻止），但调度时偏向更均衡的位置 |
+
+我们用 `DoNotSchedule` 是因为 HA 是硬要求，不能"将就"。
+
+### 19.9.6 HPA 扩 1 个 pod 时 Karpenter 怎么响应（连锁反应）
+
+假设 HPA 把 replicas 从 2 扩到 3：
+
+#### Step 1：scheduler 试图塞第 3 个 pod 到现有节点
+
+```
+现有节点 1: m6a.large, AZ=1a, 已经跑 1 个 litellm pod
+  allocatable mem 7.06 Gi
+  减去 daemonset (~200 Mi)               ≈ 6.86 Gi 真正可用
+  减去现有 litellm pod request 5 Gi      ≈ 1.86 Gi 剩余
+  
+  能塞下第 3 个 litellm pod (request 5 Gi) 吗?
+  → 不能 (1.86 Gi < 5 Gi)
+
+现有节点 2: m6a.large, AZ=1b, 已经跑 1 个 litellm pod
+  → 同样剩 1.86 Gi, 装不下
+```
+
+→ 容量先把"省钱方案"堵死。
+
+#### Step 2：scheduler 算 topologySpread
+
+```
+当前分布:  1a × 1 pod,  1b × 1 pod
+
+新 pod 想放 1a 上 (假设有空间):  1a × 2, 1b × 1
+  zone skew = 2 - 1 = 1            ✅ 不超 maxSkew=1
+  
+新 pod 想放 1b 上 (假设有空间):  对称, skew = 1, 也允许
+  
+新 pod 想堆在现有节点上 (假设有空间):
+  hostname skew = 1 (新堆的节点变 2, 其它 1, 差 1)  → 边界但允许
+  实际不会发生, 因为 Step 1 容量不够
+```
+
+→ topologySpread 本身不阻止"起新节点"，它只阻止"堆同节点"或"堆同 AZ 多个"。
+
+#### Step 3：Karpenter 接管
+
+```
+T=0:    HPA 改 replicas: 2 → 3
+T=0:    K8s 创建第 3 个 pod
+T=1s:   scheduler 找不到节点 (容量+topology) → pod 进 Pending
+        events: FailedScheduling, "0/N nodes are available"
+T=5s:   Karpenter 监听到 Pending pod, 综合判断:
+          - resource requests:  cpu 200m, mem 5Gi
+          - nodeSelector:       provisioned-by=karpenter
+          - topologySpread:     zone+hostname maxSkew=1
+        Karpenter 决策:
+          - 必须起新节点 (现有装不下)
+          - NodePool 允许的实例族 (m6i/m6a/c6i) × 大小 (large/xlarge/2xlarge)
+            中选最便宜 → m6a.large
+          - AZ 选择: 1a 或 1b 都不影响 skew, 算法挑容量更紧的 AZ
+T=10s:  Karpenter 调用 EC2 RunInstances
+T=60s:  EC2 节点起来, 注册到 K8s
+T=70s:  scheduler 把第 3 个 pod 调度上去
+T=120s: 新 pod startupProbe 通过 → 1/1 Ready
+```
+
+#### Step 4：终态
+
+```
+2 节点 → 3 节点
+2 pod  → 3 pod
+月成本: $126 → $189 (+50%)
+```
+
+### 19.9.7 边界情况
+
+#### Q1：HPA 扩到 4 pod 时？
+
+zone topologySpread 算：
+```
+2+2 (1a × 2, 1b × 2): skew = 0           ✅ 最优
+3+1 (1a × 3, 1b × 1): skew = 2  > 1      ❌ 违反
+```
+
+→ scheduler 必须 2+2 → Karpenter 起 2 个新节点（每 AZ 1 个），最终 4 节点。
+
+#### Q2：HPA 缩回 2 pod 时？
+
+```
+PDB minAvailable: 1, Deployment maxUnavailable: 0
+→ K8s 一次只 evict 1 个 pod (保证至少 N-1 个 pod 在跑)
+→ 多余 pod 优先 evict 不均衡那个 AZ 的
+→ 终态回到 2 pod (1a × 1, 1b × 1)
+
+节点空着的会被 Karpenter consolidation 30 分钟后回收 (consolidateAfter: 30m)
+→ 回到 2 节点
+```
+
+#### Q3：能不能用 m6a.xlarge 装 2 pod 省钱？
+
+```
+m6a.xlarge: 4 vCPU, 16 GiB
+  装 2 pod (5 Gi × 2 = 10 Gi < 16 Gi)  → 物理上装得下
+  月成本 ~$126, 跟 2 × m6a.large 同价
+
+但 hostname maxSkew=1 阻止:
+  2 pod 同节点 → host skew = 2  → 违反约束
+  
+→ Karpenter 即使想选 xlarge 省钱, hostname 约束也强制选 large × 2
+```
+
+**这是 hostname topologySpread 的额外作用**：不只防 SPOF，还防 Karpenter
+"省钱省过头"把所有 pod 堆一台大节点。
+
+#### Q4：Spot 节点回收时呢？
+
+未配 SQS interruption queue（参见 §19.5.4），spot 节点被 AWS 回收时：
+```
+1. AWS 给 EC2 实例 metadata 写 "2 分钟后回收"
+2. Karpenter 不知道 (没 queue)
+3. 2 分钟后实例 terminate
+4. Pod 被强杀 (没经过 graceful drain)
+5. ReplicaSet 重新调度 → Karpenter 起新节点 → 但有 60-90s 业务感知中断
+```
+
+→ 当前 NodePool 强制 `on-demand`，避免这问题。要上 spot 的话需要先配
+SQS + EventBridge interruption queue。
+
+### 19.9.8 验证当前状态的命令
+
+```bash
+# 看实际 pod 分布 (NODE 列前缀 ip-10-0-1X-... 里的 X:
+#   X=0 是 1a (private subnet 10.0.10.0/24)
+#   X=1 是 1b (private subnet 10.0.11.0/24))
+kubectl -n litellm get pods -o wide
+
+# 看 NodeClaim 跨 AZ
+kubectl get nodeclaim -o custom-columns=\
+NAME:.metadata.name,\
+TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,\
+ZONE:.metadata.labels.topology\.kubernetes\.io/zone,\
+NODE:.status.nodeName
+
+# 看 Deployment 的 topologySpreadConstraints (确认是 DoNotSchedule)
+kubectl -n litellm get deploy litellm -o jsonpath='{.spec.template.spec.topologySpreadConstraints}' | jq
+
+# 看 HPA 指标 + 副本数
+kubectl -n litellm get hpa litellm
+```
+
+#### 故意压一下来验证（生产请慎用）
+
+```bash
+# 临时把 minReplicas 改成 1, 看是否会缩
+kubectl -n litellm patch hpa litellm --type='json' \
+  -p='[{"op":"replace","path":"/spec/minReplicas","value":1}]'
+
+# 等 5 分钟 (HPA scaleDown stabilizationWindow=300s) → 应该缩到 1 pod
+# 改回 2:
+kubectl -n litellm patch hpa litellm --type='json' \
+  -p='[{"op":"replace","path":"/spec/minReplicas","value":2}]'
+# → HPA 会扩回 2, 同时 Karpenter 起新节点 (因为之前缩 pod 时 consolidation 已回收节点)
+```
+
+### 19.9.9 总结
+
+```
+HPA min=2  +  mem 5Gi 不够 1 节点装 2 pod  +  topologySpread DoNotSchedule × 2
+= 任何时候 ≥ 2 个 m6a.large
+= 跨 ≥ 2 个 AZ
+= 不堆同节点
+= 单节点挂 / 单 AZ 挂时仍有 1 个 pod 服务业务
+```
+
+成本：2 × m6a.large × $63/月 ≈ $126/月 —— 这是 HA 的明码价格。
+
+## 19.10 资源/资源使用观测命令
 
 ```bash
 # 看所有 Karpenter NodeClaim（包括过渡期未回收的）
@@ -561,9 +871,9 @@ kubectl top node
 kubectl top pod -A --sort-by=memory
 ```
 
-## 19.10 升级与版本兼容
+## 19.11 升级与版本兼容
 
-### 19.10.1 升级 EKS 控制面 K8s 版本
+### 19.11.1 升级 EKS 控制面 K8s 版本
 
 ```bash
 # 先升控制面（AWS 自动滚动 system MNG 的 AMI 跟随）
@@ -590,7 +900,7 @@ aws eks update-nodegroup-version \
   --region us-east-1
 ```
 
-### 19.10.2 升级 Karpenter controller
+### 19.11.2 升级 Karpenter controller
 
 Karpenter compatibility matrix：[https://karpenter.sh/docs/upgrading/compatibility/](https://karpenter.sh/docs/upgrading/compatibility/)
 
@@ -603,7 +913,7 @@ Karpenter compatibility matrix：[https://karpenter.sh/docs/upgrading/compatibil
 升级方式：改 `cluster-stack.ts` 里 `karpenterChart.version` 后 `cdk deploy`，
 或临时手动 helm upgrade（注意先看 release notes 有没有 CRD 变更）。
 
-### 19.10.3 控制 AMI 滚动节奏
+### 19.11.3 控制 AMI 滚动节奏
 
 如果想从 `@latest` 改成"我自己控制何时升 AMI"：
 
@@ -616,7 +926,7 @@ amiSelectorTerms: [{ alias: 'al2023@v20260512' }],
 - AWS 推新 AMI 时**不再自动 drift**
 - 升级窗口你自己定：临时改成 `@latest` 触发滚动 → 完成后改回新的固定 release
 
-## 19.11 当前的取舍清单（已知 trade-off）
+## 19.12 当前的取舍清单（已知 trade-off）
 
 按"已知 + 当前选择 + 未来可能改"列：
 
@@ -629,7 +939,7 @@ amiSelectorTerms: [{ alias: 'al2023@v20260512' }],
 | `expireAfter` | 30 天硬轮换 | `Never` 或 `90d` | 钉了 AMI 版本之后可以延长 |
 | Karpenter 版本 | v1.5.0（不官宣兼容 1.34，但实测能用） | 升 v1.6.x 跟齐 1.34 | 业务平稳时升 |
 
-## 19.12 故障排查 cheatsheet
+## 19.13 故障排查 cheatsheet
 
 | 现象 | 可能原因 | 怎么验证 / 修 |
 |---|---|---|
@@ -639,7 +949,7 @@ amiSelectorTerms: [{ alias: 'al2023@v20260512' }],
 | system 组件调度到 Karpenter 节点 | 没加 `tolerations: CriticalAddonsOnly` | 在组件 Helm values 里加上 |
 | Karpenter 起的节点立刻又被替换 | Drift 被持续触发（AMI alias 变化 / NodePool 变化） | 看 NodeClaim `Drifted` 列；`kubectl describe nodeclaim` 看 reason |
 | 节点过期立刻被替换但没 drain | 没设 PodDisruptionBudget | 给关键 Deployment 加 PDB（litellm 已经有 `minAvailable: 1`） |
-| Karpenter 报错 "version not compatible" | controller 版本跟 K8s 版本不匹配 | 看 §19.10.2 升级 Karpenter |
+| Karpenter 报错 "version not compatible" | controller 版本跟 K8s 版本不匹配 | 看 §19.11.2 升级 Karpenter |
 
 ## 相关文档
 
