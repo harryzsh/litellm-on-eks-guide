@@ -772,7 +772,7 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
             { key: 'kubernetes.io/arch', operator: 'In', values: ['amd64'] },
             { key: 'kubernetes.io/os', operator: 'In', values: ['linux'] },
             { key: 'karpenter.sh/capacity-type', operator: 'In', values: ['on-demand'] },
-            { key: 'karpenter.k8s.aws/instance-family', operator: 'In', values: ['m6i', 'm6a', 'c6i'] },
+            { key: 'karpenter.k8s.aws/instance-family', operator: 'In', values: ['m6i', 'c6i'] },
             { key: 'karpenter.k8s.aws/instance-size', operator: 'In', values: ['large', 'xlarge', '2xlarge'] },
           ],
           expireAfter: '720h',
