@@ -276,7 +276,192 @@ kubectl get configmap litellm-config -n litellm -o yaml | head -50
 | 日志 "ValueError: Missing LITELLM_MASTER_KEY" | PROXY_MASTER_KEY env 没注入 | 查 masterkeySecretName 对不对，§5.2 三段注入链 |
 | Pod 日志里 Bedrock 调用报 ExpiredToken | AKSK 已轮换但 Pod 没重启 | kubectl rollout restart deploy/litellm -n litellm |
 
-## 17.8 Step 8：Service + Ingress + Internal ALB
+## 17.8 Step 8：HPA + PDB 弹性配置验收
+
+litellm 跑起来不等于"能稳定服务"。本步骤验证两个**自动化机制**配置正确：
+
+- **HPA (Horizontal Pod Autoscaler)**：流量来了能自动扩容
+- **PDB (PodDisruptionBudget)**：节点维护/升级时不让业务挂
+
+它们都是部署后才生效的"动态行为"，需要单独验收。详细原理见
+[`19-karpenter.md`](./19-karpenter.md) §19.15。
+
+### 17.8.1 metrics-server 是 HPA 的前置依赖
+
+HPA 读 metrics 走 `metrics.k8s.io` API，这个 API 由 metrics-server 提供。
+EKS **不预装** metrics-server，HPA 装了等于摆设。
+
+```cpp
+# 1. metrics-server addon 已装
+aws eks list-addons --cluster-name <EKS_CLUSTER_NAME> --region us-east-1 \
+  --query 'addons[?@==`metrics-server`]' --output text
+# 期望：返回 metrics-server (非空)
+
+# 2. metrics-server pod 在跑
+kubectl get pods -n kube-system -l app.kubernetes.io/name=metrics-server
+# 期望：2 个 Pod READY 1/1, Running
+
+# 3. metrics.k8s.io API 可用
+kubectl api-resources --api-group=metrics.k8s.io
+# 期望：列出 nodes, pods 资源 (返回非空)
+
+# 4. 实测能拿到指标
+kubectl top node
+kubectl top pod -n litellm --containers
+# 期望：CPU(cores) / MEMORY(bytes) 列有数字, 不报 "metrics not available"
+```
+
+**没装 metrics-server 的症状**：HPA 的 TARGETS 列永远显示 `<unknown>/X%`，
+副本数永远不会因为 CPU/mem 变化。
+
+### 17.8.2 HPA 配置验收
+
+```cpp
+# 1. HPA 对象存在
+kubectl get hpa litellm -n litellm
+# 期望：MINPODS=2, MAXPODS=10, REPLICAS≥2, TARGETS 列有具体数字 (不是 <unknown>)
+
+# 2. HPA spec 验证
+kubectl get hpa litellm -n litellm -o yaml | grep -A 30 'spec:'
+# 期望:
+#   minReplicas: 2
+#   maxReplicas: 10
+#   metrics: 至少有 cpu (target 60%), 视情况有 memory (target 80%)
+#   behavior.scaleUp.stabilizationWindowSeconds: 30
+#   behavior.scaleDown.stabilizationWindowSeconds: 300
+
+# 3. HPA 当前判断详情 (Conditions / 最近一次决策)
+kubectl describe hpa litellm -n litellm
+# 期望:
+#   Reference: Deployment/litellm
+#   Min/Max replicas: 2/10
+#   Conditions:
+#     AbleToScale       True
+#     ScalingActive     True
+#     ScalingLimited    False  (除非已经在 min/max 边界)
+#   Events: 最近无 FailedGetResourceMetric / FailedComputeMetricsReplicas
+
+# 4. 没有 FailedGetResourceMetric (== metrics-server 工作正常的最强信号)
+kubectl get events -n litellm --field-selector involvedObject.kind=HorizontalPodAutoscaler --sort-by=.lastTimestamp | tail -10
+# 期望：无 Warning 类型的 FailedGetResourceMetric
+```
+
+### 17.8.3 PDB 配置验收
+
+```cpp
+# 1. PDB 对象存在
+kubectl get pdb litellm -n litellm
+# 期望：
+#   NAME      MIN AVAILABLE   ALLOWED DISRUPTIONS   AGE
+#   litellm   1               1                     ...
+# 关键: ALLOWED DISRUPTIONS=1 表示 PDB 当前允许 1 个 pod 被自愿 evict
+
+# 2. PDB selector 真匹配到 pod
+kubectl get pdb litellm -n litellm -o yaml | grep -A 5 'selector:'
+# 期望: matchLabels: {app: litellm}, 跟 Deployment.spec.selector 一致
+
+# 3. PDB 当前 status 三个数字
+kubectl get pdb litellm -n litellm -o json | jq '.status | {currentHealthy, desiredHealthy, expectedPods, disruptionsAllowed}'
+# 期望:
+#   currentHealthy: 2     (实际 ready 的 pod 数)
+#   desiredHealthy: 1     (= minAvailable)
+#   expectedPods: 2       (= Deployment.replicas)
+#   disruptionsAllowed: 1 (= currentHealthy - desiredHealthy)
+# 这 4 个数字最能反映 PDB 的实时工作状态
+
+# 4. 模拟 evict 看 PDB 是否真生效
+POD=$(kubectl get pods -n litellm -l app=litellm -o jsonpath='{.items[0].metadata.name}')
+kubectl get pod $POD -n litellm -o json | \
+  kubectl auth can-i --as system:serviceaccount:karpenter:karpenter \
+  create pods/eviction
+# (这条主要是测 RBAC, eviction 实际验证用下面 17.8.5 测试)
+```
+
+### 17.8.4 PDB 在我们这套里到底干啥
+
+PDB **只**保护"自愿中断"（voluntary disruption），不是万能 HA 保险。具体：
+
+| 场景 | PDB 是否生效 | 替代保护机制 |
+|---|---|---|
+| Karpenter drift 替换节点（5/17 那次事故） | ✅ **核心场景**：限制 Karpenter 一次只 evict 1 个 pod | — |
+| Karpenter consolidation（合并节点省钱） | ✅ 同上 | — |
+| `kubectl drain` 节点（运维手动） | ✅ drain 走 eviction API | — |
+| EKS Managed Node Group 升级 | ✅ EKS 也走 eviction API | — |
+| spot 节点被回收（配了 SQS interruption queue 时） | ✅ Karpenter 主动 evict | 没配 queue 时 → ❌ |
+| 节点真挂掉（hardware failure） | ❌ 走 DELETE 路径，不走 eviction | 跨 AZ + minReplicas=2 |
+| HPA 缩容 | ❌ 走 DELETE 路径，不走 eviction | HPA 自身 stabilizationWindow 控制节奏 |
+| Pod OOMKill | ❌ 单 pod 级，PDB 不参与 | mem limit + headroom |
+
+我们这里 `minAvailable: 1` + `replicas: 2` 的具体行为：
+
+```
+正常状态: currentHealthy=2, desiredHealthy=1 → disruptionsAllowed=1
+  → 允许 Karpenter 一次 evict 1 个 pod
+  
+evict 第 1 个: 该 pod Terminating, currentHealthy=1
+  → disruptionsAllowed=0 → 暂时阻止再 evict
+  → Karpenter 等
+  
+新 pod ready: currentHealthy=2 → disruptionsAllowed=1
+  → Karpenter 可以 evict 第 2 个
+
+→ 整个过程始终 ≥ 1 ready pod 服务业务
+```
+
+**反模式**：如果 minAvailable 设成 2（== replicas 数）：
+- disruptionsAllowed = 0 → Karpenter 永远不能 evict
+- drift 触发后节点替换**完全卡死**
+- 必须人工介入
+
+**指导原则**：`minAvailable` 应该 < replicas。replicas=2 时设 1，replicas≥4
+时建议改 `minAvailable: 50%` 让保护强度跟随副本数。
+
+### 17.8.5 联动测试：模拟 evict 看 PDB 真在保护
+
+```cpp
+# 准备：拿到当前 2 个 pod 名字
+PODS=($(kubectl get pods -n litellm -l app=litellm -o jsonpath='{.items[*].metadata.name}'))
+echo "Pod 1: ${PODS[0]}"
+echo "Pod 2: ${PODS[1]}"
+
+# 测试：第 1 次 evict（应该成功）
+kubectl proxy --port=8001 &
+PROXY_PID=$!
+sleep 2
+
+curl -k -s -X POST \
+  http://127.0.0.1:8001/api/v1/namespaces/litellm/pods/${PODS[0]}/eviction \
+  -H 'Content-Type: application/json' \
+  -d '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"'${PODS[0]}'","namespace":"litellm"}}'
+# 期望：HTTP 201 Created (无 body 或 status: Success)
+
+# 立刻测第 2 次 evict 第 2 个 pod（应该被 PDB 挡住）
+curl -k -s -X POST \
+  http://127.0.0.1:8001/api/v1/namespaces/litellm/pods/${PODS[1]}/eviction \
+  -H 'Content-Type: application/json' \
+  -d '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"'${PODS[1]}'","namespace":"litellm"}}'
+# 期望：HTTP 429 TooManyRequests, body 含 "Cannot evict pod as it would violate the pod's disruption budget"
+
+kill $PROXY_PID
+
+# 验证业务始终 ≥ 1 ready pod
+kubectl get pods -n litellm -l app=litellm
+# 期望：总有 ≥ 1 个 READY 1/1 (Deployment 会重新拉起新 pod 替代刚被 evict 的)
+```
+
+### 17.8.6 常见坑
+
+| 症状 | 根因 | 修复 |
+|---|---|---|
+| HPA TARGETS 显示 `<unknown>/X%` | metrics-server 没装 | `aws eks create-addon --addon-name metrics-server` |
+| HPA 副本数稳定在 maxReplicas，永远不缩 | mem request 太低，baseline mem utilization 已经 > target | 调大 mem request 留 headroom（参考 §19.15.1）|
+| HPA scale 太抖（频繁扩缩） | scaleDown.stabilizationWindowSeconds 太短 | 默认 300s 一般够用；有特殊 burst 模式可以调到 600s |
+| Karpenter drift 时业务**整体不可用 60-90s** | 没 PDB / PDB minAvailable=0 | 加 PDB 至少 minAvailable: 1 |
+| Karpenter drift **完全卡死**不进展 | PDB minAvailable == replicas | 调小 minAvailable（少于 replicas） |
+| `disruptionsAllowed: 0` 但没在 drift 中 | currentHealthy < desiredHealthy（pod 没 ready） | 看 pod 状态，是不是 startup 失败 / readiness 卡住 |
+| PDB selector 不匹配 pod | label 不一致（如 Deployment 用 `app.kubernetes.io/name`，PDB 用 `app`） | 对齐 selector matchLabels 与 Deployment 模板 labels |
+
+## 17.9 Step 9：Service + Ingress + Internal ALB
 
 ```cpp
 # 1. Service 存在
@@ -325,7 +510,7 @@ kubectl run alb-test --rm -it --restart=Never -n litellm \
 | Target 一直 unhealthy | healthcheck path 不对 / Pod 不 ready | annotations 确认 /health/liveliness；kubectl get pod 看 READY |
 | 502 Bad Gateway | healthcheck 过但 Pod 实际在启动 | 加 readinessProbe initialDelaySeconds |
 
-## 17.9 Step 9：CloudFront + VPC Origin
+## 17.10 Step 10：CloudFront + VPC Origin
 
 ```cpp
 # 1. VPC Origin 状态 Deployed
@@ -377,7 +562,7 @@ aws cloudfront get-distribution-config --id <CLOUDFRONT_DISTRIBUTION_ID> \
 | /ui 登录后跳到 internal-k8s-...elb.amazonaws.com | Origin Request Policy 丢 Host | 改用 Managed-AllViewer（§10） |
 | 401 Unauthorized 但 key 正确 | CloudFront 策略吞了 Authorization header | 确认 Origin Request Policy 转发 all viewer headers |
 
-## 17.10 Step 10：端到端功能验证
+## 17.11 Step 11：端到端功能验证
 
 ```cpp
 export LITELLM_MASTER_KEY="<YOUR_MASTER_KEY>"
@@ -444,7 +629,7 @@ curl -s $ENDPOINT/v1/chat/completions \
 # 第二次（换 user message 但 system 相同）：cache_read_input_tokens > 0
 ```
 
-## 17.11 日志与可观测性
+## 17.12 日志与可观测性
 
 ```cpp
 # Pod 日志（实时）
@@ -487,7 +672,7 @@ aws logs tail /aws/elasticloadbalancing/<ALB_NAME> --follow --region us-east-1
 aws s3 ls s3://litellm-logs-<ACCOUNT_ID>/litellm-logs/ --recursive | tail -5
 ```
 
-## 17.12 一键验收脚本
+## 17.13 一键验收脚本
 
 把前面所有关键检查串成一个脚本，新环境部署完跑一遍，全绿才能算完工：
 
@@ -577,7 +762,7 @@ chmod +x litellm-verify.sh
 ./litellm-verify.sh
 ```
 
-## 17.13 快速故障定位流程图
+## 17.14 快速故障定位流程图
 
 ```
 用户请求失败
@@ -616,7 +801,7 @@ chmod +x litellm-verify.sh
        └─ Network latency？→ 检查是不是跨 region
 ```
 
-## 17.14 完整验收 checklist（收工前必过）
+## 17.15 完整验收 checklist（收工前必过）
 
 - [ ] 16.2 EKS 7 项全过
 
