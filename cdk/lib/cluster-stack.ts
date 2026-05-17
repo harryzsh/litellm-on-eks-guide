@@ -190,6 +190,20 @@ export class ClusterStack extends cdk.Stack {
     writeAsgTag.node.addDependency(tagAsg);
 
     // ============================================================
+    // 3.5. metrics-server EKS Addon
+    //      Required for HPA (metrics.k8s.io API) and `kubectl top`.
+    //      EKS does NOT preinstall this. HPA targets memory/cpu
+    //      utilization will show <unknown> without it.
+    //      Pinned version compatible with K8s 1.33/1.34.
+    // ============================================================
+    const metricsServerAddon = new eks.Addon(this, 'MetricsServerAddon', {
+      cluster,
+      addonName: 'metrics-server',
+      addonVersion: 'v0.8.1-eksbuild.6',
+    });
+    metricsServerAddon.node.addDependency(mng);
+
+    // ============================================================
     // 4. Tag cluster SG with karpenter.sh/discovery so EC2NodeClass
     //    securityGroupSelectorTerms can find it. The cluster SG is
     //    created by EKS, not CDK, so we use a custom resource to tag.
@@ -555,13 +569,13 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
             {
               maxSkew: 1,
               topologyKey: 'topology.kubernetes.io/zone',
-              whenUnsatisfiable: 'ScheduleAnyway',
+              whenUnsatisfiable: 'DoNotSchedule',
               labelSelector: { matchLabels: { app: 'litellm' } },
             },
             {
               maxSkew: 1,
               topologyKey: 'kubernetes.io/hostname',
-              whenUnsatisfiable: 'ScheduleAnyway',
+              whenUnsatisfiable: 'DoNotSchedule',
               labelSelector: { matchLabels: { app: 'litellm' } },
             },
           ],
@@ -590,8 +604,8 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
                 { name: 'MAX_REQUESTS_BEFORE_RESTART', value: '10000' },
               ],
               resources: {
-                requests: { cpu: '1', memory: '3Gi' },
-                limits: { cpu: '2', memory: '6Gi' },
+                requests: { cpu: '200m', memory: '5Gi' },
+                limits: { cpu: '1500m', memory: '6Gi' },
               },
               livenessProbe: {
                 httpGet: { path: '/health/liveliness', port: 4000 },
@@ -600,10 +614,16 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
                 timeoutSeconds: 5,
                 failureThreshold: 3,
               },
+              startupProbe: {
+                httpGet: { path: '/health/readiness', port: 4000 },
+                periodSeconds: 10,
+                timeoutSeconds: 5,
+                failureThreshold: 30, // 30 × 10s = 5 min startup window
+              },
               readinessProbe: {
                 httpGet: { path: '/health/readiness', port: 4000 },
-                initialDelaySeconds: 30,
-                periodSeconds: 10,
+                initialDelaySeconds: 0,
+                periodSeconds: 5,
                 timeoutSeconds: 5,
                 failureThreshold: 3,
               },
@@ -673,7 +693,20 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
       minReplicas: 2,
       maxReplicas: 10,
       metrics: [
-        { type: 'Resource', resource: { name: 'cpu', target: { type: 'Utilization', averageUtilization: 70 } } },
+        // litellm is a streaming LLM proxy: memory grows with active SSE
+        // connections (10-100MB/stream) and concurrent request buffers,
+        // while CPU stays low during async I/O wait.
+        // Keep BOTH signals — HPA scales on whichever fires first (max).
+        //
+        // Memory request is sized at 5Gi (well above ~2.5Gi baseline) so
+        // idle utilization sits at ~50%, leaving real headroom for
+        // load-driven memory growth to actually move the HPA metric.
+        // Without that headroom, baseline alone saturates the target and
+        // HPA never fires (observed empirically with 3.2Gi request).
+        //
+        // CPU target lowered to 60% (vs default 70%) so HPA reacts before
+        // pods are CPU-throttled during the 30-60s pod startup window.
+        { type: 'Resource', resource: { name: 'cpu', target: { type: 'Utilization', averageUtilization: 60 } } },
         { type: 'Resource', resource: { name: 'memory', target: { type: 'Utilization', averageUtilization: 80 } } },
       ],
       behavior: {
