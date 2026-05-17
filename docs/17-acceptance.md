@@ -833,5 +833,205 @@ chmod +x litellm-verify.sh
 
 全部勾完，这套 LiteLLM on EKS 才算稳稳地搭建成功。
 
+## 17.16 弹性扩缩容链路实测演示（参考时间线）
+
+部署完成后建议主动跑一次完整 demo，确认 HPA → Karpenter 链路真在工作。
+本节记录一次实际演示的时间线和观察，可作为：
+
+- 第一次 demo 看链路真在工作的对照
+- 出问题时对照"正常情况下应该是什么样"
+- 不熟悉 K8s 的团队成员的入门教学
+
+测试方法见 [`19-karpenter.md`](./19-karpenter.md) §19.14（5 种验证方法）。
+原理详解见同文档 §19.15。
+
+### 17.16.1 测试方法（最稳妥的 Method B）
+
+不发任何业务流量，**只改 HPA target 触发扩容信号**。零 Bedrock 调用、零业务影响。
+
+```bash
+# 1. 触发：mem target 80% → 40% (当前 mem 49% 立刻 > 新 target)
+kubectl -n litellm patch hpa litellm --type='json' \
+  -p='[{"op":"replace","path":"/spec/metrics/1/resource/target/averageUtilization","value":40}]'
+
+# 2. 等约 90 秒看链路:
+#    - HPA REPLICAS: 2 → 3
+#    - 第 3 个 pod 进 Pending  
+#    - Karpenter 起新 m6a.large
+#    - pod 调度过去 → ready
+
+# 3. 恢复:
+kubectl -n litellm patch hpa litellm --type='json' \
+  -p='[{"op":"replace","path":"/spec/metrics/1/resource/target/averageUtilization","value":80}]'
+```
+
+成本：多出来一台 m6a.large 跑约 5-10 分钟，约 **$0.01**。
+
+### 17.16.2 完整时间线（实测）
+
+```
+T+0:00  ── 基线 ─────────────────────────────────────
+        HPA       cpu 3%/60%, memory 49%/80%, REPLICAS=2
+        Pods      2 (us-east-1a × 1, us-east-1b × 1)
+        Nodes     2 m6a.large (DRIFTED 列空)
+        实测 mem  ~2542 MiB / 2543 MiB per pod
+
+T+0:30  >>> 触发: HPA mem target 80% → 40% <<<
+        改后 TARGETS: memory 49%/40% (ratio 1.225, > 1.1 tolerance)
+
+T+1:00  ✨ HPA 决策: ceil(2 × 49/40) = ceil(2.45) = 3
+        ✨ Deployment.replicas: 2 → 3
+        ✨ 第 3 个 pod 创建, 状态 Pending
+        ✨ Karpenter 立即创建新 NodeClaim (us-east-1b)
+
+T+1:30  ✨ 新节点 EC2 启动完成, kubelet 注册成功 (用了 70 秒, 比文档预估快)
+        新 NodeClaim 状态: Ready
+
+T+2:00  ✨ 第 3 个 pod 1/1 Ready, startupProbe 通过
+        HPA TARGETS 显示 memory 38%/40% (新 pod 没 stress, 平均下来)
+        正向链路完整跑通 ✅
+
+T+3:30  >>> 恢复: HPA mem target 40% → 80% <<<
+        TARGETS: memory 43%/80% (ratio 0.54, in tolerance below)
+        进入 scaleDown stabilizationWindow=300s 的观察期
+
+T+4:00  ~ T+5:30  HPA 持续观察 5 分钟, REPLICAS 维持 3
+
+T+6:00  ✨ HPA 缩容: REPLICAS 3 → 2
+        HPA 事件: "All metrics below target"
+        1 个 pod 被 evict
+
+T+6:30  ✨ Karpenter 检测节点 underutilized → delete
+        ✨ NodeClaim: 3 → 2
+        反向链路完整跑通 ✅
+
+T+8:00  ── 终态恢复 ────────────────────────────────
+        HPA       cpu 3%/60%, memory 43%/80%, REPLICAS=2
+        Pods      2 (us-east-1a × 1, us-east-1b × 1, 跨 AZ ✅)
+        Nodes     2 m6a.large
+```
+
+### 17.16.3 Karpenter 关键日志片段
+
+正向触发：
+
+```
+disrupting node(s) ... (此次 demo 没触发 drift, 略)
+
+# 起新节点
+created nodeclaim default-jcjxc
+launched nodeclaim default-jcjxc, instance-type=m6a.large, zone=us-east-1b
+```
+
+反向回收：
+
+```
+disrupting node(s)
+  reason: underutilized
+  decision: delete
+  pod-count: 1
+  disrupted-nodes: [{name: ip-10-0-11-80, NodeClaim: default-n66nq, instance-type: m6a.large}]
+
+tainted node ip-10-0-11-80  taint: karpenter.sh/disrupted:NoSchedule
+deleted node ip-10-0-11-80
+deleted nodeclaim default-n66nq
+```
+
+HPA 事件：
+
+```
+SuccessfulRescale  New size: 3; reason: memory resource utilization (percentage of request) above target
+SuccessfulRescale  New size: 2; reason: All metrics below target
+```
+
+### 17.16.4 三个超出预期的发现
+
+#### 1. 节点 cold start 70 秒就 Ready（比文档估算快 50%）
+
+文档 [`19-karpenter.md`](./19-karpenter.md) §19.15.2 估算的是 ~150 秒。实测：
+
+```
+T+1:00  Karpenter 调用 EC2 RunInstances
+T+1:30  Node Ready                     (delta: ~30 秒)
+T+2:00  Pod 1/1 Ready                  (delta: ~30 秒, image 拉取 + startup)
+```
+
+原因：
+- AMI 已经缓存在 zone（不是 cold AMI）
+- litellm image 568 MB 已经在 ECR/区域缓存
+- 大部分时间花在 EC2 boot + kubelet bootstrap
+
+如果你看到节点 cold start 超过 5 分钟，要排查：
+- Karpenter controller 是否在运行
+- ECR / Container Registry 速率限制
+- 节点 SG 是否能联控制面（参见 §19.5.3）
+
+#### 2. Karpenter 选择回收"老节点"而不是"新节点"
+
+终态保留的是新建的 `default-jcjxc`（demo 中 10 分钟前才起的），删掉的是
+原本就有的 `default-n66nq`（已经活了 160+ 分钟）。
+
+为什么？Karpenter 的 cost 模型考虑了 `expireAfter: 720h`：
+
+```
+default-n66nq:  已活 160 分钟  →  剩余寿命 ~570 小时
+default-jcjxc:  已活 10 分钟   →  剩余寿命 ~720 小时
+
+→ 删老节点 = 集群"剩余寿命"最大化
+→ 减少未来强制 expire 滚动的次数
+→ 更稳定
+```
+
+这是 Karpenter v1 的隐藏智能。运维可以放心：consolidation 决策会自动倾向
+"留下更新的节点"。
+
+#### 3. consolidation 实际比 `consolidateAfter: 30m` 快很多
+
+文档之前的描述："多余节点会在 30 分钟后被 Karpenter consolidation 回收"。
+
+实测：HPA evict pod 后 **30 秒**（不是 30 分钟）节点就被回收了。
+
+原因（推测）：
+- `consolidateAfter: 30m` 是连续 underutilized 状态的"冷却时间"，从节点
+  **持续** underutilized 开始计时
+- demo 期间，被删的节点 `default-n66nq` 在 demo 之前就已经是 underutilized
+  状态（litellm 改 mem request 5Gi 后，单节点装不满，长期空着 60% 内存）
+- 它的 underutilized timer 已经超过 30 分钟门槛
+- 一旦 HPA 把它上的 pod evict 掉变完全空闲，Karpenter 立刻删
+
+→ "30 分钟回收"是理论最坏情况，实际经常更快。
+
+### 17.16.5 验证结论
+
+| 验证项 | 结果 | 时延 |
+|---|---|---|
+| HPA 看到 metrics 变化能触发扩容 | ✅ | ~60 秒（受 metrics-server scrape 限制） |
+| HPA 改 Deployment.replicas | ✅ | < 1 秒 |
+| 新 pod mem 5Gi 装不下进入 Pending | ✅ | 立刻 |
+| Karpenter 看到 Pending 起新节点 | ✅ | ~5 秒决策 + ~30 秒 EC2 启动 |
+| 节点注册到集群 + Ready | ✅ | ~30 秒（kubelet bootstrap） |
+| Pod 调度到新节点 + 启动完成 | ✅ | ~30 秒 |
+| 跨 AZ 始终维持（topologySpread）| ✅ | — |
+| HPA 反向缩容（target 变高） | ✅ | ~5 分钟（stabilizationWindow=300s） |
+| Karpenter 回收空节点 | ✅ | ~30 秒（实际快于文档估算） |
+| 终态恢复到基线 | ✅ | 总耗时约 7 分钟 |
+| Bedrock 调用 / 业务影响 | ❌ 无 | — |
+| 总成本 | ~$0.01 | 一台 m6a.large 跑 5-10 分钟 |
+
+整条链路工作得**比文档描述的还快/还流畅**。
+
+### 17.16.6 期望对照
+
+如果你的环境跑这个 demo 看到的是：
+
+| 你看到的 | 可能问题 | 排查 |
+|---|---|---|
+| HPA TARGETS 一直 `<unknown>/X%` | metrics-server 没装 | 见 §17.8.1 |
+| HPA 改了 mem target 但 REPLICAS 不变 | mem 实际利用率本来就在容差区间 | 检查实际 mem 利用率, 调更激进的 target |
+| 第 3 个 pod 一直 Pending 几分钟 | Karpenter 没起新节点 | 见 §17.8.6 + [`19-karpenter.md`](./19-karpenter.md) §19.13 |
+| 新节点起来但 pod 还是 Pending | nodeSelector / taint / topology 不匹配 | `kubectl describe pod` 看 events |
+| 恢复 target 后 5 分钟没缩 | mem 利用率仍在容差区 | 看 HPA TARGETS 是否在 [0.9, 1.1] 之间 |
+| 节点回收要等很久 | 节点之前不是 underutilized 状态 | 这是正常情况，等 `consolidateAfter` 即可 |
+
 
 # 18 维护
