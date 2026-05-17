@@ -1379,6 +1379,155 @@ def resolve_alias(alias_str):
 - 控制面升级 K8s 版本 → SSM 路径变了 → AMI 变了 → drift
 - AWS 推新 AMI release → SSM `recommended` 指向新 AMI → drift
 
+#### (6) 实例选择算法（候选很多时怎么挑）
+
+NodePool requirements 给出"允许的实例族 × size × AZ"组合（笛卡尔积），
+Karpenter 真要起节点时按 5 步算法选具体实例：
+
+```
+Step 1  候选集生成 (笛卡尔积)
+        NodePool requirements 全枚举
+        ↓
+Step 2  容量过滤
+        剔除装不下当前 pending pod 的实例 (cpu / mem / pods 任一维度)
+        ↓
+Step 3  拓扑过滤
+        剔除会违反 topologySpread / podAffinity 的实例 × AZ 组合
+        ↓
+Step 4  按 $/pod 升序
+        从 AWS Pricing API 拿实时 on-demand 价格
+        若同一实例能装 N 个 pending pod, 计算 $/pod = $/月 / N
+        ↓
+Step 5  选最便宜 → EC2 RunInstances
+        如果失败 (容量不够 / 配额不够) → fallback 到下一个候选
+```
+
+##### 实战例子（用我们集群的真实日志）
+
+我们 NodePool requirements:
+```yaml
+requirements:
+- {key: kubernetes.io/arch,                  values: [amd64]}
+- {key: kubernetes.io/os,                    values: [linux]}
+- {key: karpenter.sh/capacity-type,          values: [on-demand]}
+- {key: karpenter.k8s.aws/instance-family,   values: [m6i, c6i]}
+- {key: karpenter.k8s.aws/instance-size,     values: [large, xlarge, 2xlarge]}
+```
+
+笛卡尔积 = 6 实例（2 family × 3 size）× 5 AZs
+
+drift 替换时 Karpenter 实际打印的 `replacement-nodes` 字段（按价格升序）：
+
+```json
+{
+  "replacement-nodes": [{
+    "instance-types": "m6i.large, c6i.xlarge, m6i.xlarge, c6i.2xlarge, m6i.2xlarge"
+  }]
+}
+```
+
+对照价格表：
+
+| 顺序 | 实例 | vCPU | Mem | $/月 | 装几个 pod | $/pod |
+|---|---|---|---|---|---|---|
+| 1 | **m6i.large** | 2 | 8 | **$70** | 1 | **$70** ← 选这个 |
+| 2 | c6i.xlarge | 4 | 8 | $124 | 1 | $124 |
+| 3 | m6i.xlarge | 4 | 16 | $140 | 1 (受拓扑限制) | $140 |
+| 4 | c6i.2xlarge | 8 | 16 | $248 | 1 (受拓扑限制) | $248 |
+| 5 | m6i.2xlarge | 8 | 32 | $280 | 1 (受拓扑限制) | $280 |
+
+**关键观察**：
+- `c6i.large` 不在列表里 — 它 4 GiB mem 装不下 5 GiB request 的 pod，被 Step 2 剔除
+- `xlarge / 2xlarge` 单实例本来能装 2 个 pod 摊薄成本，但 `topologySpread hostname maxSkew=1` 阻止"2 pod 同节点"，被 Step 3 限制为 1 pod/实例 → $/pod 反而最贵
+- 最终 m6i.large 永远赢
+
+##### 拓扑约束怎么影响"省钱合并"
+
+在我们这套配置下：
+
+```
+方案 A: 1 × m6i.xlarge 装 2 pod  =  $140/月
+方案 B: 2 × m6i.large  各装 1 pod = $140/月
+
+A 跟 B 同价, 但 hostname maxSkew=1 不允许 2 pod 同节点
+→ A 被排除, Karpenter 必须选 B (2 节点跨 AZ)
+```
+
+**这是 hostname topologySpread 的隐藏作用**：不止防 SPOF，还**关掉了 Karpenter 省钱的"合并到大节点"路径**。如果未来想让 Karpenter 自由合并（接受 SPOF 换更省钱），需要把 hostname 改 `ScheduleAnyway`。
+
+##### 多 pod 装箱（HPA 一次扩多个时）
+
+如果 HPA 一次把 replicas 从 2 扩到 5，3 个新 pod 同时进 Pending。Karpenter
+会**整体装箱**（不是每个 pod 单独决策）：
+
+```
+3 pending pod, 每个 5 GiB
+
+候选方案 (假设没 topology 限制):
+A. 3 × m6i.large    (1 pod / 节点) = 3 × $70   = $210/月
+B. 1 × m6i.2xlarge  (32 GiB, 装 3 pod) = 1 × $280 = $280/月
+   → A 更便宜
+
+但 hostname maxSkew=1 阻止 (B): 3 pod 同节点不允许
+→ Karpenter 选 A: 起 3 个 m6i.large
+zone maxSkew=1 进一步约束: 3 pod 必须分 3 个不同 AZ (1+1+1)
+→ 起 3 节点跨 3 AZ
+```
+
+##### Fallback 机制（避免 EC2 容量异常时卡死）
+
+为啥 `replacement-nodes` 是个**列表**而不是单个？因为 EC2 RunInstances 可能失败：
+
+```
+试 m6i.large in 1a → InsufficientCapacityException
+  ↓
+试 m6i.large in 1b → 成功 → 用这个
+  ↓ 假如所有 1b 也满了
+试 c6i.xlarge in 1a → 成功 → 用这个 (虽然贵, 但能起)
+  ↓
+直到所有候选都失败才报错
+```
+
+实践中 m6 在 us-east-1 几乎不会容量不足，但对 spot 至关重要（spot 容量经常波动）。
+
+##### 价格数据从哪来
+
+Karpenter controller 周期性从 AWS Pricing API 拉价格表，缓存在内存：
+
+```
+Karpenter 启动:
+  pricing.GetProducts(ServiceCode=AmazonEC2)
+  → 拿到所有实例 × 区域 的 on-demand 价格
+  → 写入 controller 内存
+
+后续每 ~12 小时:
+  重新拉一次, 跟实时调价同步
+```
+
+价格在 NodePool / EC2NodeClass 里**没写死**，AWS 调价 Karpenter 自动用新价。
+所以你可以放心用 `instance-family: [m6i, c6i, m7i]`，让 Karpenter 在多代之间
+按当时最便宜的挑 —— 不需要手动对比代际价格。
+
+##### 我们当前候选集的可视化
+
+```
+6 种允许实例 × 2 个可用 AZ (us-east-1a, us-east-1b) = 12 个组合:
+
+us-east-1a:
+  m6i.large    $70    ✅ 装 1 pod  ← 选这个
+  m6i.xlarge   $140   ⚠️ 装 1 pod (拓扑限制, mem 浪费)
+  m6i.2xlarge  $280   ⚠️ 装 1 pod (浪费严重)
+  c6i.large    -      ❌ mem 4 GiB 不够 5 GiB
+  c6i.xlarge   $124   ⚠️ 装 1 pod (mem 浪费)
+  c6i.2xlarge  $248   ⚠️ 装 1 pod (浪费严重)
+
+us-east-1b: 完全对称的 6 个
+
+→ 现状: m6i.large × 2 跨 AZ, 每月 $140
+→ 如果 1a 容量不够: fallback 到 c6i.xlarge in 1a
+→ 如果某个 AZ 的所有 fallback 都失败: 整个 AZ 起不来 (但 1b 还能起一个 pod)
+```
+
 ### 19.15.3 HPA 和 Karpenter 怎么协同
 
 #### (1) 责任分层
