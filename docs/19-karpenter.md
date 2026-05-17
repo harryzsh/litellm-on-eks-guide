@@ -951,6 +951,523 @@ amiSelectorTerms: [{ alias: 'al2023@v20260512' }],
 | 节点过期立刻被替换但没 drain | 没设 PodDisruptionBudget | 给关键 Deployment 加 PDB（litellm 已经有 `minAvailable: 1`） |
 | Karpenter 报错 "version not compatible" | controller 版本跟 K8s 版本不匹配 | 看 §19.11.2 升级 Karpenter |
 
+## 19.14 测试 Karpenter / HPA 是否在工作
+
+新部署集群、改了 NodePool / HPA 配置、或者只是想定期演练，都需要主动验证。
+下面 5 个测试覆盖不同场景，从最安全到最接近真实故障。
+
+### 19.14.1 测试 1：强制 HPA 扩缩（最安全）
+
+**目的**：验证 HPA 能改 replicas，Karpenter 看到 Pending pod 会起新节点。
+
+```bash
+# 改 minReplicas 强制扩到 4
+kubectl -n litellm patch hpa litellm --type='json' \
+  -p='[{"op":"replace","path":"/spec/minReplicas","value":4}]'
+
+# 另开终端 watch
+kubectl -n litellm get pods -w
+kubectl get nodeclaim -w
+```
+
+期望看到：
+1. Deployment.replicas 立刻变 4，2 个新 pod 状态 Pending
+2. Karpenter 30 秒内创建 2 个新 NodeClaim（按 topologySpread 分布到 1a + 1b）
+3. ~90 秒后新 pod 1/1 Ready
+
+**恢复**：
+
+```bash
+kubectl -n litellm patch hpa litellm --type='json' \
+  -p='[{"op":"replace","path":"/spec/minReplicas","value":2}]'
+# 注意: HPA scaleDown stabilizationWindow=300s, 5 分钟后才会缩
+# Karpenter consolidation 30 分钟后回收空节点
+```
+
+### 19.14.2 测试 2：真实流量负载（验证 HPA CPU 信号）
+
+**目的**：验证流量驱动的 HPA 扩容。
+
+```bash
+# 在集群里跑 hey 对 litellm 健康端点压测（不需 auth）
+kubectl run loadgen --rm -it --restart=Never \
+  --image=williamyeh/hey -- \
+  -z 5m -c 100 -q 50 \
+  http://litellm.litellm.svc.cluster.local:4000/health/readiness
+
+# 另开终端
+kubectl -n litellm get hpa litellm -w
+```
+
+期望看到 CPU 利用率从 3% → 60%+ → HPA 触发扩容。
+
+**注意**：`/health/readiness` 是轻量 endpoint，不会真实地反映 LLM 推理负载。
+要测 LLM 流量需要用 `/v1/chat/completions` 配合 master key，量更大才能压
+出 CPU 涨幅。
+
+### 19.14.3 测试 3：单独触发 Karpenter（不动 litellm）
+
+**目的**：验证 Karpenter 看到带 nodeSelector 的 Pending pod 会起新节点。
+
+```bash
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: karpenter-test
+  namespace: default
+spec:
+  nodeSelector:
+    provisioned-by: karpenter
+  containers:
+  - name: pause
+    image: registry.k8s.io/pause:3.9
+    resources:
+      requests:
+        memory: 6Gi
+        cpu: 1
+EOF
+
+# 看
+kubectl get pod karpenter-test -w        # 应该先 Pending → 后 Running
+kubectl get nodeclaim                    # 应该新增一个
+
+# 看 Karpenter 控制器决策日志
+kubectl -n karpenter logs -l app.kubernetes.io/name=karpenter --tail=30 | \
+  grep -iE 'launched|nodeclaim'
+
+# 清理
+kubectl delete pod karpenter-test
+# 30 分钟后 consolidation 自动回收新节点
+```
+
+### 19.14.4 测试 4：跨 AZ 容错（cordon 1a 看 1b 还服务吗）
+
+**目的**：验证 topologySpread 真在跨 AZ + 单 AZ 不可用时业务还活。
+
+```bash
+# Cordon 所有 1a 节点 (不让新 pod 调度过去, 已有 pod 不动)
+kubectl get nodes -l topology.kubernetes.io/zone=us-east-1a -o name | \
+  xargs -I {} kubectl cordon {}
+
+# 验证 1b 的 pod 还在 ready
+kubectl -n litellm get pods -o wide
+
+# 测 endpoint
+kubectl run curl-test --rm -it --image=curlimages/curl --restart=Never -- \
+  curl -s http://litellm.litellm.svc.cluster.local:4000/health/readiness
+
+# 恢复
+kubectl get nodes -l topology.kubernetes.io/zone=us-east-1a -o name | \
+  xargs -I {} kubectl uncordon {}
+```
+
+### 19.14.5 测试 5：模拟节点失效（drain 一个节点）
+
+**目的**：验证 PDB + topologySpread + Karpenter 共同保证滚动期间业务不中断。
+
+```bash
+# 拿一个 Karpenter 节点的名字
+NODE=$(kubectl get pods -n litellm -o jsonpath='{.items[0].spec.nodeName}')
+echo "Will drain: $NODE"
+
+# Drain (会触发 evict + Karpenter 起新节点)
+kubectl drain $NODE --ignore-daemonsets --delete-emptydir-data --force
+
+# 期望发生:
+# 1. PDB minAvailable=1 阻止瞬时全 evict
+# 2. 一个 pod 被 evict → 新 pod 创建 → topologySpread 必须跨 AZ
+#    → 现有节点不够装 → Karpenter 起新节点 → 调度 → ready
+# 3. drain 完成
+
+kubectl -n litellm get pods -o wide -w
+kubectl get nodeclaim
+
+# 恢复 (drain 后 Karpenter 会按 consolidation 30min 回收旧空节点)
+kubectl uncordon $NODE
+```
+
+### 19.14.6 测试结果速查表
+
+| 测试 | 期望看到 | 看不到 = 哪里挂了 |
+|---|---|---|
+| 1 | HPA 改 replicas + Karpenter 起 NodeClaim | metrics-server / IRSA / NodePool |
+| 2 | HPA cpu utilization 涨 + replicas 自动扩 | metrics-server / HPA target 设错 |
+| 3 | Pending pod → 新 NodeClaim → Running | Karpenter controller / IAM / SG 标签 |
+| 4 | 1b 的 pod 仍 Ready，新请求成功 | topologySpread 没 DoNotSchedule / 实际只 1 AZ |
+| 5 | drain 期间始终 ≥ 1 pod ready | PDB 没设 / minAvailable 太松 |
+
+## 19.15 原理深入：HPA 和 Karpenter 怎么 work
+
+前面章节都在讲"怎么用"。本节讲"它们到底怎么实现的"，理解原理后排查问题
+和调优能直接看到本质。
+
+### 19.15.1 HPA 的工作原理
+
+#### (1) 谁在跑 HPA
+
+HPA 不是独立 deployment，是 **kube-controller-manager**（EKS 控制平面里）
+内的一个 controller —— `horizontal-pod-autoscaler-controller`。
+
+你看不到它的 pod，但它一直在 reconcile loop 里：
+
+```
+每 15 秒 (--horizontal-pod-autoscaler-sync-period):
+  对每个 HorizontalPodAutoscaler 对象:
+    1. 拉当前 pod 的指标
+    2. 算出期望 replicas
+    3. 改 Deployment.spec.replicas
+```
+
+#### (2) 指标数据流
+
+```
+                    ┌──────────────────────────────────────┐
+                    │  EKS 控制平面                         │
+                    │  ┌───────────────────────────────┐  │
+HPA 配的指标:        │  │ HPA controller (in kcm)       │  │
+  - cpu/memory  ─→  │  │   query: metrics.k8s.io API   │  │
+                    │  └────────────┬──────────────────┘  │
+                    │               │                      │
+                    │               ▼                      │
+                    │  ┌───────────────────────────────┐  │
+                    │  │ K8s API server                │  │
+                    │  │   /apis/metrics.k8s.io/v1beta1│  │
+                    │  └────────────┬──────────────────┘  │
+                    └───────────────┼──────────────────────┘
+                                    │ aggregated API
+                                    ▼
+                    ┌─────────────────────────────────────┐
+                    │ metrics-server (kube-system)        │
+                    │  scrape interval: 60s               │
+                    └────────────┬────────────────────────┘
+                                 │ /metrics/resource
+                    ┌────────────┴────────────────┐
+                    ▼                             ▼
+              ┌─────────┐                   ┌─────────┐
+              │ kubelet │                   │ kubelet │
+              │ Node 1  │  ...              │ Node N  │
+              │ cgroup  │                   │ cgroup  │
+              │ stats   │                   │ stats   │
+              └─────────┘                   └─────────┘
+```
+
+每个环节延迟：
+- kubelet → cgroup 读数据：~1s
+- metrics-server scrape kubelet：默认 60s 一次（**这是最慢的环节**）
+- HPA poll metrics API：15s
+
+→ HPA 看到的 CPU/mem 数据**最新也是 60 秒前**。
+→ 业务流量瞬时翻倍，HPA 要至少 60-75 秒才"知道"。
+
+#### (3) 决策公式
+
+```
+desiredReplicas = ceil(currentReplicas × currentMetricValue / desiredMetricValue)
+```
+
+**关键**：分母是 `target`，不是 `limit`，**也不是 capacity**。
+`utilization` 永远是 `usage / request × 100%`。
+
+举例（你当前的 HPA）：
+
+```
+配置: target cpu=60%, target mem=80%, replicas=2
+
+某时刻 metrics:
+  cpu: 30m × 2 pods,  request 200m → utilization = 30/200 = 15%
+  mem: 2.5GiB × 2,    request 5GiB → utilization = 50%
+
+desired_cpu = ceil(2 × 15/60) = ceil(0.5) = 1, but minReplicas=2 → 2
+desired_mem = ceil(2 × 50/80) = ceil(1.25) = 2
+
+→ HPA 取 max(2, 2) = 2 → 不改
+```
+
+#### (4) Tolerance（防抖动）
+
+如果 `currentValue / target` 落在 [0.9, 1.1] 区间，HPA **不动**：
+
+```
+| ratio        | 行为              |
+|--------------|------------------|
+| 0.0 - 0.9    | 缩容 (scale down) |
+| 0.9 - 1.1    | 不动 (in tolerance) |
+| 1.1 - ∞      | 扩容 (scale up)   |
+```
+
+这是防止指标在 target 附近抖动反复触发扩缩。所以 mem 78%/80% = ratio 0.975 →
+**HPA 不动**，即使 78% < 80%（这是之前我们卡死 4 副本的精确根因）。
+
+#### (5) 多指标怎么算
+
+`metrics: [cpu, memory]` 时：
+1. 各自算 `desired`
+2. 取 **max**（最激进的指标主导扩容，最保守的指标主导缩容）
+
+我们当前配置：
+```yaml
+metrics:
+- {cpu, target 60%}
+- {memory, target 80%}
+```
+→ CPU 涨过 60%（mem 还低）也会扩；mem 涨过 80%（CPU 还低）也会扩。**任一指标
+触发即扩**。但缩容必须 **两个指标都低于 target**才触发。
+
+#### (6) Behavior policies（控制扩缩节奏）
+
+```yaml
+behavior:
+  scaleUp:
+    stabilizationWindowSeconds: 30      # 30s 内持续过阈才扩
+    policies:
+    - type: Percent
+      value: 100                        # 一次最多翻倍
+      periodSeconds: 30
+    - type: Pods
+      value: 4                          # 一次最多 +4 个
+      periodSeconds: 30
+    selectPolicy: Max                   # 取较激进
+  scaleDown:
+    stabilizationWindowSeconds: 300     # 5 min 持续低于阈才缩
+    policies:
+    - type: Percent
+      value: 50                         # 一次最多砍 50%
+      periodSeconds: 60
+```
+
+- **stabilizationWindowSeconds**：在这个时间窗内，HPA 用历史最大（扩）/最小（缩）
+  作为决策依据，防止瞬时抖动。
+- **scaleUp 30s 较短**：流量真上来要快扩。
+- **scaleDown 300s 较长**：缩容保守，业务下来一点不要立刻撤资源（万一是抖动）。
+
+#### (7) HPA 不直接管 pod
+
+HPA 只改 `Deployment.spec.replicas` —— 后面的 pod 创建/删除是 ReplicaSet
+controller 干的，pod 调度由 scheduler 干。
+
+```
+HPA → Deployment.replicas = 3
+        ↓ (Deployment controller)
+      ReplicaSet.replicas = 3
+        ↓ (ReplicaSet controller)
+      创建 Pod (status: Pending)
+        ↓ (scheduler)
+      调度到节点 (或者继续 Pending → 触发 Karpenter)
+```
+
+→ HPA 跟 Karpenter 之间没有直接通信。它们的连接点是 K8s 的"Pending pod"事件。
+
+### 19.15.2 Karpenter 的工作原理
+
+#### (1) 核心架构
+
+Karpenter 是 K8s controller，跑在 `karpenter` namespace（你这里 2 副本）。
+它 watch 这些资源：
+
+- **Pods**：找 Pending 状态的，特别是 `FailedScheduling` 事件
+- **Nodes**：监控节点状态（Ready / 容量 / labels）
+- **NodePool / EC2NodeClass**：CRD 配置变化
+- **NodeClaim**：Karpenter 自己的 CRD，每台 Karpenter 节点对应一个
+
+它有 IAM 权限调 AWS API：
+- `ec2:RunInstances` / `TerminateInstances`：起/删 EC2
+- `ssm:GetParameter`：解析 EKS-optimized AMI ID
+- `pricing:GetProducts`：选最便宜实例
+- `iam:PassRole`：把节点 role 赋给 EC2
+
+#### (2) Provisioning（起新节点）流程
+
+```
+T=0:    K8s 里出现 Pending pod (scheduler 失败)
+        events: FailedScheduling, "0/N nodes are available"
+        
+T=1s:   Karpenter watch 到 Pending pod
+        把 unschedulable pods 按"兼容性"分组 (相同 nodeSelector,
+        affinity, tolerations, topologySpread, ...)
+
+T=2s:   对每组 pod, 模拟调度:
+        - 先看 NodePool requirements 允许的实例族 × 大小笛卡尔积
+        - 对每种实例 (m6a.large, m6a.xlarge, ...) 算:
+          这台节点能装下几个 pending pod?
+        - 选 "$/pod" 最便宜的方案
+        - 同时考虑 topologySpread, AZ 平衡, AMI 价格
+
+T=3s:   决策完成, 生成 NodeClaim 对象 (karpenter CRD)
+        spec 里写好: 实例类型, AZ, AMI, IAM role, userdata, ...
+
+T=5s:   Karpenter 调用 EC2 RunInstances
+        附带 userdata: bootstrap script
+          - 注入 cluster CA cert
+          - 配 kubelet args (node labels, taints)
+          - 启动 kubelet → 自动加入集群
+
+T=30s:  EC2 进入 running 状态
+
+T=60s:  kubelet 起来, 注册到 EKS API server
+        Node 对象出现, status: NotReady
+
+T=70s:  CNI plugin 配好, node 变 Ready
+        Karpenter 把 NodeClaim 状态从 Launched 改 Ready
+
+T=70s:  scheduler 看 Ready node 满足 pending pod 的所有约束
+        → 调度 pod 上去
+
+T=70-150s: Pod 容器启动, readiness/startup probe 通过 → 1/1 Ready
+```
+
+整个 cold start: **~70 秒到节点 Ready，~150 秒到 pod 真正服务**。
+
+#### (3) Disruption（替换/删除节点）的 5 类触发
+
+| 类型 | 触发条件 | 例子 |
+|---|---|---|
+| **Empty** | 节点上没 pod | HPA 缩 pod 后空节点（NodePool `WhenEmpty` 时立刻删，`WhenEmptyOrUnderutilized` 时也算） |
+| **Underutilized** | 把 pod 重新调度到别处会更便宜 | 你有 4 个 pod 4 节点（每节点 1 个），算下来塞 2 个 m6a.xlarge 更便宜（如果没 hostname spread 限制） |
+| **Drift** | NodeClaim 当前状态 ≠ NodePool/EC2NodeClass 期望 | AMI alias `@latest` 解析出新 AMI ID，旧节点 AMI 不匹配 → 标记 drift |
+| **Expiration** | 节点活了超过 `expireAfter` | 720h (30 天) 到期硬替换 |
+| **Interruption** | AWS 即将回收节点 | spot 中断、AZ rebalance、health check failure |
+
+每种 disruption 都遵循 PDB + topologySpread + budgets 约束（不会一次干掉所有节点）。
+
+#### (4) Consolidation 算法（最酷的部分）
+
+每隔 `consolidateAfter` 时间（你配的 30m），Karpenter 评估：
+
+```
+当前: 4 节点 (各跑 1 个 litellm pod)
+  m6a.large × 4 = $252/月
+
+候选方案 A: m6a.xlarge × 2 (各跑 2 个 pod)
+  4 × 2 = $252/月  → 同价
+  但是 topologySpread hostname maxSkew=1 不允许 2 pod 同节点
+  → 候选方案 A 不可行
+
+候选方案 B: 换更便宜实例族
+  没有更便宜的能装 5Gi mem 的 large 实例
+  → 没用
+
+→ 没有更便宜方案 → 维持现状
+```
+
+如果存在更便宜方案 + 满足所有约束（PDB, topology, affinity）→ Karpenter
+按 budgets 滚动替换。
+
+#### (5) AMI alias 解析机制
+
+`amiSelectorTerms: [{alias: 'al2023@latest'}]` 的内部展开：
+
+```python
+# Karpenter 伪代码
+def resolve_alias(alias_str):
+    family, version = alias_str.split('@')   # 'al2023', 'latest'
+    
+    cluster_k8s_version = get_cluster_k8s_version()   # e.g., '1.34'
+    
+    if version == 'latest':
+        for arch in ['x86_64', 'arm64']:
+          for variant in ['standard', 'nvidia', 'neuron']:
+              ssm_path = f'/aws/service/eks/optimized-ami/{cluster_k8s_version}/amazon-linux-2023/{arch}/{variant}/recommended/image_id'
+              ami_id = ssm.get_parameter(ssm_path)
+              yield ami_id
+    else:
+        # 解析具体 release tag, 通过 SSM 历史版本或直接 AMI 描述
+        ...
+```
+
+这就是为什么：
+- 控制面升级 K8s 版本 → SSM 路径变了 → AMI 变了 → drift
+- AWS 推新 AMI release → SSM `recommended` 指向新 AMI → drift
+
+### 19.15.3 HPA 和 Karpenter 怎么协同
+
+#### (1) 责任分层
+
+```
+┌─────────────────────────────────────────┐
+│ HPA   = 应用层弹性                        │
+│ "我要几个副本?"  →  改 Deployment.replicas │
+│ 关心: 业务负载 (CPU / mem / RPS)          │
+└─────────────────────────────────────────┘
+              ↓ (副本数变化)
+┌─────────────────────────────────────────┐
+│ K8s scheduler                            │
+│ "新 pod 调度到哪? 现有节点装得下吗?"      │
+└─────────────────────────────────────────┘
+              ↓ (装不下 → Pending)
+┌─────────────────────────────────────────┐
+│ Karpenter = 基础设施层弹性                │
+│ "需要新节点? 起什么实例? 在哪 AZ?"        │
+│ 关心: scheduling 约束 + 成本             │
+└─────────────────────────────────────────┘
+```
+
+**它们之间没有直接通信。** 通过 K8s 的 Pending pod 事件解耦。
+
+#### (2) 流量上升的完整时间线
+
+```
+T+0s     业务流量翻倍, litellm pod CPU 30% → 80%
+T+0s     metrics-server 60s 后才收集到新数据 (这是延迟瓶颈)
+T+60s    HPA 看到 cpu 80%/60% (utilization 1.33 > 1.1 tolerance)
+T+60s    HPA 等 stabilizationWindowSeconds=30s 确认稳定
+T+90s    HPA 算: ceil(2 × 80/60) = 3 → 改 Deployment.replicas: 2 → 3
+T+90s    K8s 创建第 3 个 pod
+T+91s    scheduler 发现现有节点装不下 → Pod Pending
+T+95s    Karpenter watch 到 Pending pod, 决策 + 起 EC2
+T+150s   新节点 Ready, scheduler 调度 pod
+T+200s   新 pod startup probe 通过, 1/1 Ready
+T+200s   流量分到 3 个 pod, CPU 各自约 53%
+```
+
+→ **流量翻倍到完全扩出来**：~3.5 分钟。
+
+#### (3) 流量下降的完整时间线
+
+```
+T+0s     业务流量减半, CPU 53% → 27% (3 pods 后)
+T+60s    HPA 看到 cpu 27%/60% (utilization 0.45)
+T+60s    HPA 等 stabilizationWindowSeconds=300s 确认稳定 (反抖动)
+T+360s   HPA 算: ceil(3 × 27/60) = 2 → Deployment.replicas: 3 → 2
+T+360s   K8s evict 一个 pod (按 PDB 约束)
+T+370s   pod 删除, 节点上跑的 pod 数变 0
+T+370s   节点变 underutilized 状态
+T+370s   Karpenter 等 consolidateAfter=30min 确认稳定
+T+2170s  Karpenter 删除空节点 (drain + EC2 TerminateInstances)
+T+2200s  EC2 实例真正消失, 账单开始按 2 个节点计
+```
+
+→ **流量减半到节点回收**：~36 分钟。**故意慢**，避免抖动反复。
+
+#### (4) 4 种典型失败模式
+
+| 失败模式 | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| HPA 没 metrics | HPA TARGETS 显示 `<unknown>/X%`，永远不扩 | metrics-server 没装 | 装 metrics-server addon |
+| Karpenter 没 pending pod | HPA 改了 replicas，pod 一直 Pending，节点不扩 | NodePool 限额 / 实例约束太严 | 看 `kubectl describe pod` events 找具体原因 |
+| 资源 request 配错 | HPA 一启动就立刻扩到 maxReplicas，永远不缩 | request 远小于 baseline → utilization 永远 > target | 把 request 调大到留 headroom |
+| topologySpread 阻止 Karpenter 决策 | NodeClaim 一直创建失败，"no instance type satisfies all constraints" | 约束太严（如要求 GPU + 跨 6 AZ + 128 GiB） | 放宽约束或检查实际可用实例 |
+
+#### (5) HPA 和 Karpenter 的关键差异
+
+| 维度 | HPA | Karpenter |
+|---|---|---|
+| 跑在哪 | EKS 控制面（kube-controller-manager 内）| 数据面 pod（karpenter namespace）|
+| 用什么数据决策 | metrics.k8s.io 提供的 cpu/mem | scheduler API + EC2 pricing API |
+| 决策频率 | 每 15s | 事件驱动 + 每分钟 reconcile |
+| 反应延迟 | ~60-90s（受 metrics-server scrape 限制）| ~5-10s（看到 Pending 即决策）|
+| 改什么 | Deployment.spec.replicas | 创建 NodeClaim → EC2 RunInstances |
+| 不改什么 | 不直接创建 pod，不管节点 | 不直接管 pod 数，不知道业务负载 |
+| 反向操作 | `scaleDown` 减 replicas | `disruption` 删节点 |
+
+→ **HPA 是"业务层"快反应，Karpenter 是"资源层"慢决策**。两层 timing 错开
+是优点（防抖动），代价是端到端反应延迟较长（~3-4 分钟从流量变化到节点扩到位）。
+
+如果业务对秒级反应要求高，应该考虑：
+- **Pre-warm**：HPA `minReplicas` 设大点，常驻多余容量
+- **Predictive scaling**：用 KEDA + 时间表（cron）提前扩
+- **Custom metrics**：HPA 不看 cpu，看队列深度 / RPS（更先于 CPU 涨）
+
 ## 相关文档
 
 - [`01-architecture.md`](./01-architecture.md) — 整体架构
