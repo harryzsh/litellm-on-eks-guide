@@ -576,8 +576,6 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
             REDIS_PASSWORD: '{{ index . "config.REDIS_PASSWORD" }}',
             AWS_ACCESS_KEY_ID_1: '{{ index . "config.AWS_ACCESS_KEY_ID_1" }}',
             AWS_SECRET_ACCESS_KEY_1: '{{ index . "config.AWS_SECRET_ACCESS_KEY_1" }}',
-            AWS_ACCESS_KEY_ID_2: '{{ index . "config.AWS_ACCESS_KEY_ID_2" }}',
-            AWS_SECRET_ACCESS_KEY_2: '{{ index . "config.AWS_SECRET_ACCESS_KEY_2" }}',
             // Built from RDS-managed secret. host/port/username/password
             // are RDS managed; database name is templated in.
             DATABASE_URL: `postgresql://{{ index . "rds.username" }}:{{ index . "rds.password" }}@{{ index . "rds.host" }}:{{ index . "rds.port" }}/${props.databaseName}`,

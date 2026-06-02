@@ -183,8 +183,6 @@ export class DataStack extends cdk.Stack {
           REDIS_PASSWORD: '',
           AWS_ACCESS_KEY_ID_1: 'CHANGE_ME',
           AWS_SECRET_ACCESS_KEY_1: 'CHANGE_ME',
-          AWS_ACCESS_KEY_ID_2: 'CHANGE_ME',
-          AWS_SECRET_ACCESS_KEY_2: 'CHANGE_ME',
         }),
         generateStringKey: 'LITELLM_MASTER_KEY',
         excludePunctuation: true,
