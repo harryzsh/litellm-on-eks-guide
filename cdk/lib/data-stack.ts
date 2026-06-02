@@ -60,7 +60,7 @@ export class DataStack extends cdk.Stack {
 
     const rdsInstance = new rds.DatabaseInstance(this, 'Postgres', {
       engine: rds.DatabaseInstanceEngine.postgres({
-        version: rds.PostgresEngineVersion.VER_16_4,
+        version: rds.PostgresEngineVersion.VER_16_8,
       }),
       instanceType: ec2.InstanceType.of(
         ec2.InstanceClass.M6G,

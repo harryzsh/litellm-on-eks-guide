@@ -81,8 +81,10 @@ export class ClusterStack extends cdk.Stack {
     //    t3.medium × 2, CriticalAddonsOnly taint.
     //    Business workloads must NOT schedule here.
     // ============================================================
+    const nodegroupName = `${props.projectName}-nodes`;
     const mng = cluster.addNodegroupCapacity('SystemNodegroup', {
-      nodegroupName: `${props.projectName}-nodes`,
+      nodegroupName: nodegroupName,
+      amiType: eks.NodegroupAmiType.AL2023_X86_64_STANDARD,
       instanceTypes: [ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM)],
       minSize: 2,
       maxSize: 2,
@@ -117,18 +119,18 @@ export class ClusterStack extends cdk.Stack {
         action: 'describeNodegroup',
         parameters: {
           clusterName: props.clusterName,
-          nodegroupName: mng.nodegroupName,
+          nodegroupName: nodegroupName,
         },
-        physicalResourceId: PhysicalResourceId.of(`tag-${mng.nodegroupName}-asg`),
+        physicalResourceId: PhysicalResourceId.of(`tag-${nodegroupName}-asg`),
       },
       onUpdate: {
         service: 'EKS',
         action: 'describeNodegroup',
         parameters: {
           clusterName: props.clusterName,
-          nodegroupName: mng.nodegroupName,
+          nodegroupName: nodegroupName,
         },
-        physicalResourceId: PhysicalResourceId.of(`tag-${mng.nodegroupName}-asg`),
+        physicalResourceId: PhysicalResourceId.of(`tag-${nodegroupName}-asg`),
       },
       policy: AwsCustomResourcePolicy.fromStatements([
         new iam.PolicyStatement({
@@ -161,7 +163,7 @@ export class ClusterStack extends cdk.Stack {
             },
           ],
         },
-        physicalResourceId: PhysicalResourceId.of(`asg-tag-${mng.nodegroupName}`),
+        physicalResourceId: PhysicalResourceId.of(`asg-tag-${nodegroupName}`),
       },
       onUpdate: {
         service: 'AutoScaling',
@@ -177,7 +179,7 @@ export class ClusterStack extends cdk.Stack {
             },
           ],
         },
-        physicalResourceId: PhysicalResourceId.of(`asg-tag-${mng.nodegroupName}`),
+        physicalResourceId: PhysicalResourceId.of(`asg-tag-${nodegroupName}`),
       },
       policy: AwsCustomResourcePolicy.fromStatements([
         new iam.PolicyStatement({
@@ -284,10 +286,24 @@ export class ClusterStack extends cdk.Stack {
       );
     const karpenterPolicyDoc = iam.PolicyDocument.fromJson(JSON.parse(karpenterPolicyJson));
 
+    // Pre-create namespaces for SAs (helm chart createNamespace would happen
+     // too late — IRSA SA creation runs before helm install in CDK).
+    const karpenterNs = cluster.addManifest('KarpenterNamespace', {
+      apiVersion: 'v1',
+      kind: 'Namespace',
+      metadata: { name: 'karpenter' },
+    });
+    const esoNs = cluster.addManifest('ExternalSecretsNamespace', {
+      apiVersion: 'v1',
+      kind: 'Namespace',
+      metadata: { name: 'external-secrets' },
+    });
+
     const karpenterControllerSa = cluster.addServiceAccount('KarpenterControllerSa', {
       name: 'karpenter',
       namespace: 'karpenter',
     });
+    karpenterControllerSa.node.addDependency(karpenterNs);
     new iam.Policy(this, 'KarpenterControllerPolicy', {
       policyName: `${props.projectName}-karpenter-controller`,
       document: karpenterPolicyDoc,
@@ -316,6 +332,7 @@ export class ClusterStack extends cdk.Stack {
       name: 'external-secrets',
       namespace: 'external-secrets',
     });
+    esoSa.node.addDependency(esoNs);
     props.litellmSecret.grantRead(esoSa);
     props.rdsSecret.grantRead(esoSa);
 
@@ -331,12 +348,40 @@ export class ClusterStack extends cdk.Stack {
       release: 'external-secrets',
       version: '0.10.7', // helm chart version (app version is v0.10.x)
       namespace: 'external-secrets',
-      createNamespace: true,
+      createNamespace: false,
+      wait: true,
+      timeout: cdk.Duration.minutes(15),
       values: {
         installCRDs: true,
+        replicaCount: 1,
         serviceAccount: {
           create: false,
           name: 'external-secrets',
+        },
+        // Tolerate CriticalAddonsOnly taint so pods can schedule on system MNG.
+        tolerations: [
+          {
+            key: 'CriticalAddonsOnly',
+            operator: 'Exists',
+          },
+        ],
+        webhook: {
+          replicaCount: 1,
+          tolerations: [
+            {
+              key: 'CriticalAddonsOnly',
+              operator: 'Exists',
+            },
+          ],
+        },
+        certController: {
+          replicaCount: 1,
+          tolerations: [
+            {
+              key: 'CriticalAddonsOnly',
+              operator: 'Exists',
+            },
+          ],
         },
       },
     });
@@ -349,14 +394,32 @@ export class ClusterStack extends cdk.Stack {
       release: 'aws-load-balancer-controller',
       version: '1.13.0', // matches app v3.3.0 controller image
       namespace: 'kube-system',
+      wait: true,
+      timeout: cdk.Duration.minutes(15),
       values: {
         clusterName: props.clusterName,
+        // AL2023 lowers the IMDS hop limit to 1 by default which blocks ALB
+        // controller's IMDS-based VPC discovery. Pass vpcId + region explicitly
+        // so the controller never falls back to IMDS.
+        vpcId: props.vpc.vpcId,
+        region: cdk.Stack.of(this).region,
         serviceAccount: {
           create: false,
           name: 'aws-load-balancer-controller',
         },
         // Avoid noisy default webhook on managed nodes during early cluster init.
         enableServiceMutatorWebhook: false,
+        // Single replica reduces resource pressure on the 2x t3.medium system MNG.
+        replicaCount: 1,
+        // System nodes are tainted CriticalAddonsOnly; ALB controller must tolerate
+        // it to schedule, otherwise webhook has no endpoints and ingress creation
+        // fails before karpenter has a chance to provision worker nodes.
+        tolerations: [
+          {
+            key: 'CriticalAddonsOnly',
+            operator: 'Exists',
+          },
+        ],
       },
     });
     albControllerChart.node.addDependency(albControllerSa);
@@ -364,11 +427,13 @@ export class ClusterStack extends cdk.Stack {
 
     const karpenterChart = cluster.addHelmChart('Karpenter', {
       chart: 'karpenter',
-      repository: 'oci://public.ecr.aws/karpenter',
+      // OCI registry: repository must include the namespace; full ref becomes
+      // public.ecr.aws/karpenter/karpenter:1.5.0
+      repository: 'oci://public.ecr.aws/karpenter/karpenter',
       release: 'karpenter',
       version: '1.5.0',
       namespace: 'karpenter',
-      createNamespace: true,
+      createNamespace: false,
       values: {
         settings: {
           clusterName: props.clusterName,
@@ -444,7 +509,7 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
 
   // 2. ClusterSecretStore (uses ESO IRSA SA via JWT auth)
   const clusterSecretStore = cluster.addManifest('AwsSecretsManagerStore', {
-    apiVersion: 'external-secrets.io/v1',
+    apiVersion: 'external-secrets.io/v1beta1',
     kind: 'ClusterSecretStore',
     metadata: { name: 'aws-secrets-manager' },
     spec: {
@@ -469,7 +534,7 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
   // 3. ExternalSecret — pulls litellm/config + rds-master secrets and
   //    builds DATABASE_URL via templating.
   const externalSecret = cluster.addManifest('LitellmExternalSecret', {
-    apiVersion: 'external-secrets.io/v1',
+    apiVersion: 'external-secrets.io/v1beta1',
     kind: 'ExternalSecret',
     metadata: { name: 'litellm-secrets', namespace: ns },
     spec: {
