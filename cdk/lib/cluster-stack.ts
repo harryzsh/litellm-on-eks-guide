@@ -564,18 +564,23 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
         creationPolicy: 'Owner',
         template: {
           engineVersion: 'v2',
+          // ESO `dataFrom.rewrite` with target `config.$1` / `rds.$1`
+          // produces flat keys (e.g. `config.LITELLM_MASTER_KEY`) on the
+          // template root context, not a nested `.config` object. Go
+          // templates can't traverse a dotted key as a path, so we must
+          // use `index . "config.X"` to access them.
           data: {
-            LITELLM_MASTER_KEY: '{{ .config.LITELLM_MASTER_KEY }}',
-            REDIS_HOST: '{{ .config.REDIS_HOST }}',
-            REDIS_PORT: '{{ .config.REDIS_PORT }}',
-            REDIS_PASSWORD: '{{ .config.REDIS_PASSWORD }}',
-            AWS_ACCESS_KEY_ID_1: '{{ .config.AWS_ACCESS_KEY_ID_1 }}',
-            AWS_SECRET_ACCESS_KEY_1: '{{ .config.AWS_SECRET_ACCESS_KEY_1 }}',
-            AWS_ACCESS_KEY_ID_2: '{{ .config.AWS_ACCESS_KEY_ID_2 }}',
-            AWS_SECRET_ACCESS_KEY_2: '{{ .config.AWS_SECRET_ACCESS_KEY_2 }}',
+            LITELLM_MASTER_KEY: '{{ index . "config.LITELLM_MASTER_KEY" }}',
+            REDIS_HOST: '{{ index . "config.REDIS_HOST" }}',
+            REDIS_PORT: '{{ index . "config.REDIS_PORT" }}',
+            REDIS_PASSWORD: '{{ index . "config.REDIS_PASSWORD" }}',
+            AWS_ACCESS_KEY_ID_1: '{{ index . "config.AWS_ACCESS_KEY_ID_1" }}',
+            AWS_SECRET_ACCESS_KEY_1: '{{ index . "config.AWS_SECRET_ACCESS_KEY_1" }}',
+            AWS_ACCESS_KEY_ID_2: '{{ index . "config.AWS_ACCESS_KEY_ID_2" }}',
+            AWS_SECRET_ACCESS_KEY_2: '{{ index . "config.AWS_SECRET_ACCESS_KEY_2" }}',
             // Built from RDS-managed secret. host/port/username/password
             // are RDS managed; database name is templated in.
-            DATABASE_URL: `postgresql://{{ .rds.username }}:{{ .rds.password }}@{{ .rds.host }}:{{ .rds.port }}/${props.databaseName}`,
+            DATABASE_URL: `postgresql://{{ index . "rds.username" }}:{{ index . "rds.password" }}@{{ index . "rds.host" }}:{{ index . "rds.port" }}/${props.databaseName}`,
           },
         },
       },
