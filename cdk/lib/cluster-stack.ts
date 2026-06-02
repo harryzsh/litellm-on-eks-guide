@@ -27,15 +27,23 @@ export interface ClusterStackProps extends cdk.StackProps {
 }
 
 /**
- * EKS cluster + IAM (Karpenter / aws-lbc / external-secrets IRSA)
- *   + Helm charts (external-secrets / aws-lbc / Karpenter)
+ * EKS cluster + IAM (Karpenter / aws-lbc IRSA, litellm pod IRSA for CSI)
+ *   + Helm charts (Secrets Store CSI Driver + AWS provider / aws-lbc / Karpenter)
  *   + k8s manifests (litellm namespace, configmap, deploy, svc, ing,
- *     hpa, pdb, ESO ClusterSecretStore + ExternalSecret, EC2NodeClass,
- *     NodePool).
+ *     hpa, pdb, SecretProviderClass, EC2NodeClass, NodePool).
  *
  * Replicates source terraform/{eks,karpenter,secrets-manager}.tf
  * and k8s/{00-05,20-21}.yaml, minus all kiro resources and the
  * `kiro-gateway-secrets` envFrom on the litellm Deployment.
+ *
+ * Secrets sync: uses the Kubernetes Secrets Store CSI Driver with the
+ * AWS provider. The litellm pod mounts a CSI tmpfs volume backed by a
+ * SecretProviderClass; `secretObjects` syncs the mounted contents into
+ * a K8s Secret named `litellm-secrets` so existing envFrom references
+ * keep working. (Replaced External Secrets Operator: ESO 0.10 template
+ * + dataFrom rewrite produced flat keys like `config.X` rather than a
+ * nested `.config.X` object, so `{{ .config.X }}` templates never
+ * resolved and the K8s Secret was never created.)
  *
  * Deploy order (CDK dependencies handle this):
  *   1. EKS cluster + OIDC provider
@@ -44,12 +52,12 @@ export interface ClusterStackProps extends cdk.StackProps {
  *      (EKS does not propagate nodegroup-level tags to ASG/EC2)
  *   4. AwsCustomResource: tag cluster SG with karpenter.sh/discovery
  *      (cluster SG is EKS-managed, not CDK-owned)
- *   5. IRSA roles + Karpenter node role + access entry
- *   6. Helm: external-secrets, aws-lbc, karpenter (parallel-ish; CDK
- *      sequences via dependencies)
- *   7. Manifests: namespace, ESO store, configmap, deploy, svc, ing,
- *      hpa, pdb, EC2NodeClass, NodePool — each with addDependency on
- *      the controller that owns its CRDs
+ *   5. IRSA roles + Karpenter node role + access entry + litellm pod SA
+ *   6. Helm: secrets-store-csi-driver + AWS provider, aws-lbc, karpenter
+ *      (parallel-ish; CDK sequences via dependencies)
+ *   7. Manifests: namespace, configmap, deploy, svc, ing, hpa, pdb,
+ *      SecretProviderClass, EC2NodeClass, NodePool — each with
+ *      addDependency on the controller that owns its CRDs
  */
 export class ClusterStack extends cdk.Stack {
   public readonly cluster: eks.Cluster;
@@ -312,12 +320,6 @@ export class ClusterStack extends cdk.Stack {
       kind: 'Namespace',
       metadata: { name: 'karpenter' },
     });
-    const esoNs = cluster.addManifest('ExternalSecretsNamespace', {
-      apiVersion: 'v1',
-      kind: 'Namespace',
-      metadata: { name: 'external-secrets' },
-    });
-
     const karpenterControllerSa = cluster.addServiceAccount('KarpenterControllerSa', {
       name: 'karpenter',
       namespace: 'karpenter',
@@ -346,66 +348,84 @@ export class ClusterStack extends cdk.Stack {
       roles: [albControllerSa.role],
     });
 
-    // 5d. External Secrets IRSA
-    const esoSa = cluster.addServiceAccount('ExternalSecretsSa', {
-      name: 'external-secrets',
-      namespace: 'external-secrets',
+    // 5d. litellm namespace + pod ServiceAccount + IRSA — used by the
+    //     Secrets Store CSI Driver to fetch SecretsManager objects on the
+    //     pod's behalf. Namespace is pre-created here so the SA (created
+    //     during synth) can attach to it without ordering issues; we pass
+    //     the construct through to addLitellmManifests so downstream
+    //     manifests depend on the same Namespace resource.
+    const litellmNamespace = cluster.addManifest('LitellmNamespace', {
+      apiVersion: 'v1',
+      kind: 'Namespace',
+      metadata: { name: 'litellm' },
     });
-    esoSa.node.addDependency(esoNs);
-    props.litellmSecret.grantRead(esoSa);
-    props.rdsSecret.grantRead(esoSa);
+    const litellmSa = cluster.addServiceAccount('LitellmSa', {
+      name: 'litellm',
+      namespace: 'litellm',
+    });
+    litellmSa.node.addDependency(litellmNamespace);
+    props.litellmSecret.grantRead(litellmSa);
+    props.rdsSecret.grantRead(litellmSa);
 
     // ============================================================
     // 6. Helm charts
-    //    Order: external-secrets first (other manifests depend on it),
+    //    Order: secrets-store CSI driver + AWS provider first (the
+    //    SecretProviderClass + pod CSI volume depend on it),
     //    then aws-lbc (ingress depends on it),
     //    then karpenter (nodepool/nodeclass depend on it).
     // ============================================================
-    const externalSecretsChart = cluster.addHelmChart('ExternalSecrets', {
-      chart: 'external-secrets',
-      repository: 'https://charts.external-secrets.io',
-      release: 'external-secrets',
-      version: '0.10.7', // helm chart version (app version is v0.10.x)
-      namespace: 'external-secrets',
-      createNamespace: false,
+
+    // 6a. Secrets Store CSI Driver — runs as DaemonSet, registers the
+    //     `secrets-store.csi.k8s.io` CSI driver, and (with syncSecret
+    //     enabled) reconciles `secretObjects` from the SPC into K8s
+    //     Secrets so existing envFrom/secretKeyRef usage keeps working.
+    const csiDriverChart = cluster.addHelmChart('SecretsStoreCsiDriver', {
+      chart: 'secrets-store-csi-driver',
+      repository: 'https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts',
+      release: 'csi-secrets-store',
+      namespace: 'kube-system',
+      version: '1.4.6',
       wait: true,
       timeout: cdk.Duration.minutes(15),
       values: {
-        installCRDs: true,
-        replicaCount: 1,
-        serviceAccount: {
-          create: false,
-          name: 'external-secrets',
-        },
-        // Tolerate CriticalAddonsOnly taint so pods can schedule on system MNG.
+        // Required so SecretProviderClass.secretObjects materialise as
+        // real K8s Secret objects (otherwise contents only exist in the
+        // mounted tmpfs volume).
+        syncSecret: { enabled: true },
+        // Auto-rotate when the upstream SecretsManager value changes.
+        enableSecretRotation: true,
+        rotationPollInterval: '60s',
+        // DaemonSet must run on the CriticalAddonsOnly system MNG too.
         tolerations: [
           {
             key: 'CriticalAddonsOnly',
             operator: 'Exists',
           },
         ],
-        webhook: {
-          replicaCount: 1,
-          tolerations: [
-            {
-              key: 'CriticalAddonsOnly',
-              operator: 'Exists',
-            },
-          ],
-        },
-        certController: {
-          replicaCount: 1,
-          tolerations: [
-            {
-              key: 'CriticalAddonsOnly',
-              operator: 'Exists',
-            },
-          ],
-        },
       },
     });
-    // Helm install must wait until SA exists, otherwise it would create one.
-    externalSecretsChart.node.addDependency(esoSa);
+
+    // 6b. AWS provider for the CSI driver — talks to SecretsManager / SSM
+    //     and feeds the secrets to the driver via the AWS provider gRPC
+    //     plugin socket on the host.
+    const csiAwsProviderChart = cluster.addHelmChart('SecretsStoreCsiDriverAwsProvider', {
+      chart: 'secrets-store-csi-driver-provider-aws',
+      repository: 'https://aws.github.io/secrets-store-csi-driver-provider-aws',
+      release: 'secrets-provider-aws',
+      namespace: 'kube-system',
+      version: '0.3.10',
+      wait: true,
+      timeout: cdk.Duration.minutes(15),
+      values: {
+        tolerations: [
+          {
+            key: 'CriticalAddonsOnly',
+            operator: 'Exists',
+          },
+        ],
+      },
+    });
+    csiAwsProviderChart.node.addDependency(csiDriverChart);
 
     const albControllerChart = cluster.addHelmChart('AwsLoadBalancerController', {
       chart: 'aws-load-balancer-controller',
@@ -485,16 +505,17 @@ export class ClusterStack extends cdk.Stack {
     karpenterChart.node.addDependency(tagClusterSg);
 
     // ============================================================
-    // 7. k8s manifests (namespace, ESO, configmap, app, ingress,
-    //    hpa, pdb, Karpenter EC2NodeClass + NodePool).
+    // 7. k8s manifests (configmap, app, ingress, hpa, pdb,
+    //    SecretProviderClass, Karpenter EC2NodeClass + NodePool).
     // ============================================================
     addLitellmManifests(this, cluster, {
       ...props,
-      externalSecretsChart,
+      csiAwsProviderChart,
       albControllerChart,
       karpenterChart,
       karpenterNodeRoleName: karpenterNodeRole.roleName,
-      esoServiceAccountName: 'external-secrets',
+      litellmServiceAccountName: 'litellm',
+      litellmNamespaceManifest: litellmNamespace,
     });
 
     new cdk.CfnOutput(this, 'ClusterName', { value: cluster.clusterName });
@@ -509,94 +530,94 @@ export class ClusterStack extends cdk.Stack {
 // Manifest helper — separated for readability
 // ============================================================
 interface ManifestProps extends ClusterStackProps {
-  externalSecretsChart: eks.HelmChart;
+  csiAwsProviderChart: eks.HelmChart;
   albControllerChart: eks.HelmChart;
   karpenterChart: eks.HelmChart;
   karpenterNodeRoleName: string;
-  esoServiceAccountName: string;
+  litellmServiceAccountName: string;
+  litellmNamespaceManifest: eks.KubernetesManifest;
 }
 
 function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: ManifestProps) {
   const ns = 'litellm';
+  // Namespace is created in the constructor (so the SA can attach during
+  // synth) and reused here as a dependency anchor.
+  const namespace = props.litellmNamespaceManifest;
 
-  // 1. namespace
-  const namespace = cluster.addManifest('LitellmNamespace', {
-    apiVersion: 'v1',
-    kind: 'Namespace',
-    metadata: { name: ns },
-  });
-
-  // 2. ClusterSecretStore (uses ESO IRSA SA via JWT auth)
-  const clusterSecretStore = cluster.addManifest('AwsSecretsManagerStore', {
-    apiVersion: 'external-secrets.io/v1beta1',
-    kind: 'ClusterSecretStore',
-    metadata: { name: 'aws-secrets-manager' },
-    spec: {
-      provider: {
-        aws: {
-          service: 'SecretsManager',
-          region: cdk.Stack.of(scope).region,
-          auth: {
-            jwt: {
-              serviceAccountRef: {
-                name: props.esoServiceAccountName,
-                namespace: 'external-secrets',
-              },
-            },
-          },
-        },
-      },
+  // 2. SecretProviderClass — drives the Secrets Store CSI Driver to fetch
+  //    SecretsManager objects (litellm/config + rds-master) onto pod
+  //    tmpfs, and (via secretObjects) sync them into K8s Secret
+  //    `litellm-secrets` so existing envFrom/secretKeyRef references work
+  //    unchanged. The DATABASE_URL is composed at pod runtime via env-var
+  //    interpolation in the Deployment, since the CSI driver does not
+  //    template values like ESO does.
+  const litellmSecretJmesPath = [
+    { path: 'AWS_ACCESS_KEY_ID_1', objectAlias: 'AWS_ACCESS_KEY_ID_1' },
+    { path: 'AWS_SECRET_ACCESS_KEY_1', objectAlias: 'AWS_SECRET_ACCESS_KEY_1' },
+    { path: 'AWS_ACCESS_KEY_ID_2', objectAlias: 'AWS_ACCESS_KEY_ID_2' },
+    { path: 'AWS_SECRET_ACCESS_KEY_2', objectAlias: 'AWS_SECRET_ACCESS_KEY_2' },
+    { path: 'LITELLM_MASTER_KEY', objectAlias: 'LITELLM_MASTER_KEY' },
+    { path: 'REDIS_HOST', objectAlias: 'REDIS_HOST' },
+    { path: 'REDIS_PORT', objectAlias: 'REDIS_PORT' },
+    { path: 'REDIS_PASSWORD', objectAlias: 'REDIS_PASSWORD' },
+  ];
+  const rdsSecretJmesPath = [
+    { path: 'username', objectAlias: 'RDS_USERNAME' },
+    { path: 'password', objectAlias: 'RDS_PASSWORD' },
+    { path: 'host', objectAlias: 'RDS_HOST' },
+    { path: 'port', objectAlias: 'RDS_PORT' },
+  ];
+  const spcObjects = [
+    {
+      objectName: props.litellmSecret.secretName,
+      objectType: 'secretsmanager',
+      jmesPath: litellmSecretJmesPath,
     },
-  });
-  clusterSecretStore.node.addDependency(props.externalSecretsChart);
+    {
+      objectName: props.rdsSecret.secretName,
+      objectType: 'secretsmanager',
+      jmesPath: rdsSecretJmesPath,
+    },
+  ];
 
-  // 3. ExternalSecret — pulls litellm/config + rds-master secrets and
-  //    builds DATABASE_URL via templating.
-  const externalSecret = cluster.addManifest('LitellmExternalSecret', {
-    apiVersion: 'external-secrets.io/v1beta1',
-    kind: 'ExternalSecret',
+  const secretProviderClass = cluster.addManifest('LitellmSpc', {
+    apiVersion: 'secrets-store.csi.x-k8s.io/v1',
+    kind: 'SecretProviderClass',
     metadata: { name: 'litellm-secrets', namespace: ns },
     spec: {
-      refreshInterval: '1h',
-      secretStoreRef: { name: 'aws-secrets-manager', kind: 'ClusterSecretStore' },
-      target: {
-        name: 'litellm-secrets',
-        creationPolicy: 'Owner',
-        template: {
-          engineVersion: 'v2',
-          data: {
-            LITELLM_MASTER_KEY: '{{ .config.LITELLM_MASTER_KEY }}',
-            REDIS_HOST: '{{ .config.REDIS_HOST }}',
-            REDIS_PORT: '{{ .config.REDIS_PORT }}',
-            REDIS_PASSWORD: '{{ .config.REDIS_PASSWORD }}',
-            AWS_ACCESS_KEY_ID_1: '{{ .config.AWS_ACCESS_KEY_ID_1 }}',
-            AWS_SECRET_ACCESS_KEY_1: '{{ .config.AWS_SECRET_ACCESS_KEY_1 }}',
-            AWS_ACCESS_KEY_ID_2: '{{ .config.AWS_ACCESS_KEY_ID_2 }}',
-            AWS_SECRET_ACCESS_KEY_2: '{{ .config.AWS_SECRET_ACCESS_KEY_2 }}',
-            // Built from RDS-managed secret. host/port/username/password
-            // are RDS managed; database name is templated in.
-            DATABASE_URL: `postgresql://{{ .rds.username }}:{{ .rds.password }}@{{ .rds.host }}:{{ .rds.port }}/${props.databaseName}`,
-          },
-        },
+      provider: 'aws',
+      parameters: {
+        region: cdk.Stack.of(scope).region,
+        // The AWS provider expects `objects` as a YAML string.
+        objects: yaml.dump(spcObjects),
       },
-      dataFrom: [
+      // Sync the mounted secrets into a K8s Secret named `litellm-secrets`
+      // so the Deployment can keep using envFrom. `objectName` here must
+      // match an `objectAlias` (or raw `objectName`) declared above.
+      secretObjects: [
         {
-          extract: {
-            key: props.litellmSecret.secretName,
-          },
-          rewrite: [{ regexp: { source: '(.*)', target: 'config.$1' } }],
-        },
-        {
-          extract: {
-            key: props.rdsSecret.secretName,
-          },
-          rewrite: [{ regexp: { source: '(.*)', target: 'rds.$1' } }],
+          secretName: 'litellm-secrets',
+          type: 'Opaque',
+          data: [
+            { objectName: 'AWS_ACCESS_KEY_ID_1', key: 'AWS_ACCESS_KEY_ID_1' },
+            { objectName: 'AWS_SECRET_ACCESS_KEY_1', key: 'AWS_SECRET_ACCESS_KEY_1' },
+            { objectName: 'AWS_ACCESS_KEY_ID_2', key: 'AWS_ACCESS_KEY_ID_2' },
+            { objectName: 'AWS_SECRET_ACCESS_KEY_2', key: 'AWS_SECRET_ACCESS_KEY_2' },
+            { objectName: 'LITELLM_MASTER_KEY', key: 'LITELLM_MASTER_KEY' },
+            { objectName: 'REDIS_HOST', key: 'REDIS_HOST' },
+            { objectName: 'REDIS_PORT', key: 'REDIS_PORT' },
+            { objectName: 'REDIS_PASSWORD', key: 'REDIS_PASSWORD' },
+            { objectName: 'RDS_USERNAME', key: 'RDS_USERNAME' },
+            { objectName: 'RDS_PASSWORD', key: 'RDS_PASSWORD' },
+            { objectName: 'RDS_HOST', key: 'RDS_HOST' },
+            { objectName: 'RDS_PORT', key: 'RDS_PORT' },
+          ],
         },
       ],
     },
   });
-  externalSecret.node.addDependency(clusterSecretStore);
-  externalSecret.node.addDependency(namespace);
+  secretProviderClass.node.addDependency(props.csiAwsProviderChart);
+  secretProviderClass.node.addDependency(namespace);
 
   // 4. ConfigMap (litellm config.yaml)
   const litellmConfigYaml = fs.readFileSync(
@@ -647,6 +668,9 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
           },
         },
         spec: {
+          // Use the CSI-driver-backed SA so the pod can pull SecretsManager
+          // values via IRSA. Must match the SA created in the constructor.
+          serviceAccountName: props.litellmServiceAccountName,
           terminationGracePeriodSeconds: 60,
           nodeSelector: { 'provisioned-by': 'karpenter' },
           topologySpreadConstraints: [
@@ -681,11 +705,21 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
                 { name: 'http', containerPort: 4000 },
                 { name: 'health', containerPort: 8001 },
               ],
+              // The CSI driver's secretObjects sync materialises this Secret
+              // with all individual keys (RDS_USERNAME etc.) but does NOT
+              // template a composite DATABASE_URL the way ESO did. Pull the
+              // raw fields via envFrom and assemble DATABASE_URL via K8s
+              // env-var interpolation: $(VAR) substitutes from earlier env
+              // vars in the same container, including envFrom-derived ones.
               envFrom: [{ secretRef: { name: 'litellm-secrets' } }],
               env: [
                 { name: 'LITELLM_LOG', value: 'ERROR' },
                 { name: 'LITELLM_LOCAL_MODEL_COST_MAP', value: 'True' },
                 { name: 'MAX_REQUESTS_BEFORE_RESTART', value: '10000' },
+                {
+                  name: 'DATABASE_URL',
+                  value: `postgresql://$(RDS_USERNAME):$(RDS_PASSWORD)@$(RDS_HOST):$(RDS_PORT)/${props.databaseName}`,
+                },
               ],
               resources: {
                 requests: { cpu: '200m', memory: '5Gi' },
@@ -718,16 +752,34 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
                   subPath: 'config.yaml',
                   readOnly: true,
                 },
+                // Mounting the CSI volume is what triggers the driver to
+                // fetch SecretsManager values and (with syncSecret) sync
+                // them into the K8s Secret referenced by envFrom above.
+                {
+                  name: 'secrets-store',
+                  mountPath: '/mnt/secrets-store',
+                  readOnly: true,
+                },
               ],
             },
           ],
-          volumes: [{ name: 'config', configMap: { name: 'litellm-config' } }],
+          volumes: [
+            { name: 'config', configMap: { name: 'litellm-config' } },
+            {
+              name: 'secrets-store',
+              csi: {
+                driver: 'secrets-store.csi.k8s.io',
+                readOnly: true,
+                volumeAttributes: { secretProviderClass: 'litellm-secrets' },
+              },
+            },
+          ],
         },
       },
     },
   });
   deployment.node.addDependency(configMap);
-  deployment.node.addDependency(externalSecret);
+  deployment.node.addDependency(secretProviderClass);
 
   // 7. Ingress (internal ALB)
   const ingress = cluster.addManifest('LitellmIngress', {
@@ -870,7 +922,4 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
     },
   });
   nodePool.node.addDependency(ec2NodeClass);
-
-  // Suppress unused-import warning
-  void yaml;
 }
