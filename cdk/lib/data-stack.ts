@@ -38,6 +38,8 @@ export class DataStack extends cdk.Stack {
   public readonly logsBucket: s3.IBucket;
   public readonly redisHost: string;
   public readonly databaseName: string;
+  public readonly rdsSecurityGroup: ec2.ISecurityGroup;
+  public readonly redisSecurityGroup: ec2.ISecurityGroup;
 
   constructor(scope: Construct, id: string, props: DataStackProps) {
     super(scope, id, props);
@@ -189,6 +191,9 @@ export class DataStack extends cdk.Stack {
         passwordLength: 32,
       },
     });
+
+    this.rdsSecurityGroup = rdsSg;
+    this.redisSecurityGroup = redisSg;
 
     new cdk.CfnOutput(this, 'LitellmSecretArn', { value: this.litellmSecret.secretArn });
     new cdk.CfnOutput(this, 'LitellmSecretName', { value: this.litellmSecret.secretName });

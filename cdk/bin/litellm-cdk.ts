@@ -39,6 +39,8 @@ const cluster = new ClusterStack(app, `${projectName}-Cluster`, {
   sharedNodeSecurityGroup: network.sharedNodeSecurityGroup,
   litellmSecret: data.litellmSecret,
   rdsSecret: data.rdsSecret,
+  rdsSecurityGroup: data.rdsSecurityGroup,
+  redisSecurityGroup: data.redisSecurityGroup,
   redisHost: data.redisHost,
   databaseName: data.databaseName,
   clusterName,
