@@ -604,10 +604,11 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
   externalSecret.node.addDependency(namespace);
 
   // 4. ConfigMap (litellm config.yaml)
-  const litellmConfigYaml = fs.readFileSync(
-    path.join(__dirname, 'manifests', 'litellm-config.yaml'),
-    'utf8',
-  );
+  const bedrockRegion =
+    (scope.node.tryGetContext('bedrockRegion') as string) ?? 'us-east-1';
+  const litellmConfigYaml = fs
+    .readFileSync(path.join(__dirname, 'manifests', 'litellm-config.yaml'), 'utf8')
+    .replace(/__BEDROCK_REGION__/g, bedrockRegion);
   const configMap = cluster.addManifest('LitellmConfigMap', {
     apiVersion: 'v1',
     kind: 'ConfigMap',
