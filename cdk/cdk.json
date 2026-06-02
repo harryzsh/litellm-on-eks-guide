@@ -8,6 +8,7 @@
     "clusterName": "litellm-cluster",
     "projectName": "litellm",
     "litellmImage": "docker.litellm.ai/berriai/litellm:v1.83.14-stable.patch.3",
+    "bedrockRegion": "us-east-1",
     "@aws-cdk/aws-iam:minimizePolicies": true,
     "@aws-cdk/core:checkSecretUsage": true,
     "@aws-cdk/core:target-partitions": ["aws"]
