@@ -19,6 +19,8 @@ export interface ClusterStackProps extends cdk.StackProps {
   readonly sharedNodeSecurityGroup: ec2.ISecurityGroup;
   readonly litellmSecret: secretsmanager.ISecret;
   readonly rdsSecret: secretsmanager.ISecret;
+  readonly rdsSecurityGroup: ec2.ISecurityGroup;
+  readonly redisSecurityGroup: ec2.ISecurityGroup;
   readonly redisHost: string;
   readonly databaseName: string;
   readonly clusterName: string;
@@ -75,6 +77,30 @@ export class ClusterStack extends cdk.Stack {
       securityGroup: props.sharedNodeSecurityGroup as ec2.SecurityGroup,
     });
     this.cluster = cluster;
+
+    // EKS managed nodegroup uses the EKS auto-created cluster SG (eks-cluster-sg-*),
+    // NOT props.sharedNodeSecurityGroup. RDS/Redis SG ingress from sharedNodeSG alone
+    // can't reach pods. Authorize the cluster SG explicitly.
+    //
+    // Ingress rules are created as standalone CfnSecurityGroupIngress resources
+    // in this (cluster) stack to avoid a Data->Cluster cyclic reference: the SG
+    // belongs to DataStack but the source is the cluster SG defined here.
+    new ec2.CfnSecurityGroupIngress(this, 'RdsIngressFromClusterSg', {
+      groupId: props.rdsSecurityGroup.securityGroupId,
+      sourceSecurityGroupId: cluster.clusterSecurityGroup.securityGroupId,
+      ipProtocol: 'tcp',
+      fromPort: 5432,
+      toPort: 5432,
+      description: 'Postgres from EKS cluster SG (auto-created by EKS for managed nodegroup)',
+    });
+    new ec2.CfnSecurityGroupIngress(this, 'RedisIngressFromClusterSg', {
+      groupId: props.redisSecurityGroup.securityGroupId,
+      sourceSecurityGroupId: cluster.clusterSecurityGroup.securityGroupId,
+      ipProtocol: 'tcp',
+      fromPort: 6379,
+      toPort: 6379,
+      description: 'Redis from EKS cluster SG (auto-created by EKS for managed nodegroup)',
+    });
 
     // Grant kubectl access to named admin principals. Without this, anyone
     // other than the cluster creator role (the role that ran `cdk deploy`)
