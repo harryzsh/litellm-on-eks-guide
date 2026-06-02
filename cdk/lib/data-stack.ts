@@ -70,7 +70,7 @@ export class DataStack extends cdk.Stack {
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       databaseName: props.projectName,
       credentials: rds.Credentials.fromGeneratedSecret(props.projectName, {
-        secretName: `${props.projectName}/rds-master`,
+        secretName: `${this.region}-${props.projectName}/rds-master`,
       }),
       multiAz: true,
       allocatedStorage: 100,
@@ -110,11 +110,11 @@ export class DataStack extends cdk.Stack {
     const redisSubnetGroup = new elasticache.CfnSubnetGroup(this, 'RedisSubnetGroup', {
       description: `${props.projectName} redis subnet group`,
       subnetIds: props.vpc.privateSubnets.map((s) => s.subnetId),
-      cacheSubnetGroupName: `${props.projectName}-redis`,
+      cacheSubnetGroupName: `${this.region}-${props.projectName}-redis`,
     });
 
     const redis = new elasticache.CfnReplicationGroup(this, 'Redis', {
-      replicationGroupId: `${props.projectName}-redis-prod`,
+      replicationGroupId: `${this.region}-${props.projectName}-redis-prod`,
       replicationGroupDescription: 'LiteLLM Redis for rate limiting and routing state',
       engine: 'redis',
       engineVersion: '7.1',
@@ -174,7 +174,7 @@ export class DataStack extends cdk.Stack {
     // the RDS-managed secret.
     // ------------------------------------------------------------
     this.litellmSecret = new secretsmanager.Secret(this, 'LitellmConfig', {
-      secretName: `${props.projectName}/config`,
+      secretName: `${this.region}-${props.projectName}/config`,
       description: 'LiteLLM proxy secrets (master key, Redis, AKSK)',
       generateSecretString: {
         secretStringTemplate: JSON.stringify({

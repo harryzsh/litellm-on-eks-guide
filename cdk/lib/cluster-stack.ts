@@ -81,7 +81,7 @@ export class ClusterStack extends cdk.Stack {
     //    t3.medium × 2, CriticalAddonsOnly taint.
     //    Business workloads must NOT schedule here.
     // ============================================================
-    const nodegroupName = `${props.projectName}-nodes`;
+    const nodegroupName = `${this.region}-${props.projectName}-nodes`;
     const mng = cluster.addNodegroupCapacity('SystemNodegroup', {
       nodegroupName: nodegroupName,
       amiType: eks.NodegroupAmiType.AL2023_X86_64_STANDARD,
@@ -248,7 +248,7 @@ export class ClusterStack extends cdk.Stack {
 
     // 5a. Karpenter node role (attached to EC2 instances Karpenter creates)
     const karpenterNodeRole = new iam.Role(this, 'KarpenterNodeRole', {
-      roleName: `${props.projectName}-karpenter-node`,
+      roleName: `${this.region}-${props.projectName}-karpenter-node`,
       assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonEKSWorkerNodePolicy'),
@@ -259,7 +259,7 @@ export class ClusterStack extends cdk.Stack {
     });
 
     new iam.CfnInstanceProfile(this, 'KarpenterNodeInstanceProfile', {
-      instanceProfileName: `${props.projectName}-karpenter-node`,
+      instanceProfileName: `${this.region}-${props.projectName}-karpenter-node`,
       roles: [karpenterNodeRole.roleName],
     });
 
@@ -305,7 +305,7 @@ export class ClusterStack extends cdk.Stack {
     });
     karpenterControllerSa.node.addDependency(karpenterNs);
     new iam.Policy(this, 'KarpenterControllerPolicy', {
-      policyName: `${props.projectName}-karpenter-controller`,
+      policyName: `${this.region}-${props.projectName}-karpenter-controller`,
       document: karpenterPolicyDoc,
       roles: [karpenterControllerSa.role],
     });
@@ -322,7 +322,7 @@ export class ClusterStack extends cdk.Stack {
       namespace: 'kube-system',
     });
     new iam.Policy(this, 'AlbControllerPolicy', {
-      policyName: `${props.projectName}-lb-controller`,
+      policyName: `${this.region}-${props.projectName}-lb-controller`,
       document: albPolicyDoc,
       roles: [albControllerSa.role],
     });
