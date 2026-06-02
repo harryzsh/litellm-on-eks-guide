@@ -3,7 +3,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as eks from 'aws-cdk-lib/aws-eks';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
-import { KubectlV33Layer } from '@aws-cdk/lambda-layer-kubectl-v33';
+import { KubectlV35Layer } from '@aws-cdk/lambda-layer-kubectl-v35';
 import {
   AwsCustomResource,
   AwsCustomResourcePolicy,
@@ -61,8 +61,8 @@ export class ClusterStack extends cdk.Stack {
     // 1. EKS cluster
     // ============================================================
     const cluster = new eks.Cluster(this, 'Cluster', {
-      version: eks.KubernetesVersion.V1_33,
-      kubectlLayer: new KubectlV33Layer(this, 'KubectlLayer'),
+      version: eks.KubernetesVersion.V1_35,
+      kubectlLayer: new KubectlV35Layer(this, 'KubectlLayer'),
       clusterName: props.clusterName,
       vpc: props.vpc,
       vpcSubnets: [
@@ -75,6 +75,25 @@ export class ClusterStack extends cdk.Stack {
       securityGroup: props.sharedNodeSecurityGroup as ec2.SecurityGroup,
     });
     this.cluster = cluster;
+
+    // Grant kubectl access to named admin principals. Without this, anyone
+    // other than the cluster creator role (the role that ran `cdk deploy`)
+    // gets "the server has asked for the client to provide credentials".
+    // Override via context: -c clusterAdminPrincipals='["arn:aws:iam::...:user/foo"]'
+    const adminPrincipals = (this.node.tryGetContext('clusterAdminPrincipals') as string[]) ?? [
+      `arn:aws:iam::${this.account}:user/Harry`,
+    ];
+    adminPrincipals.forEach((principalArn, idx) => {
+      new eks.AccessEntry(this, `AdminAccessEntry${idx}`, {
+        cluster,
+        principal: principalArn,
+        accessPolicies: [
+          eks.AccessPolicy.fromAccessPolicyName('AmazonEKSClusterAdminPolicy', {
+            accessScopeType: eks.AccessScopeType.CLUSTER,
+          }),
+        ],
+      });
+    });
 
     // ============================================================
     // 2. EKS Managed Nodegroup — system nodes

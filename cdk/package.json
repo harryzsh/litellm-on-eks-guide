@@ -19,7 +19,7 @@
     "typescript": "^5.6.3"
   },
   "dependencies": {
-    "@aws-cdk/lambda-layer-kubectl-v33": "^2.0.0",
+    "@aws-cdk/lambda-layer-kubectl-v35": "^2.0.0",
     "aws-cdk-lib": "^2.176.0",
     "constructs": "^10.4.2",
     "js-yaml": "^4.1.0"
