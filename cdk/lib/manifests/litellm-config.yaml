@@ -18,6 +18,10 @@ model_list:
       aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
       aws_region_name: __BEDROCK_REGION__
     model_info:
+      # opus-4-8 isn't in this image's (v1.83.14) bundled cost map, so litellm
+      # defaults supports_reasoning=False and drop_params silently strips the
+      # (adaptive) thinking param. Force it on so thinking blocks pass through.
+      supports_reasoning: true
       input_cost_per_token: 0.000005
       output_cost_per_token: 0.000025
       cache_read_input_token_cost: 0.0000005

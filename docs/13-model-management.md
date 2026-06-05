@@ -114,3 +114,36 @@ curl https://<YOUR_CLOUDFRONT_DOMAIN>/v1/models \
 **格式一定是bedrock/converse/ app inference profile ARN**
 
 ![image](TV9Vb9VtXoGGFfxT8qpcfzndnZb)
+
+
+### 13.5 新模型没有 thinking block（reasoning 被静默丢弃）
+
+**现象：** 新模型（如 `claude-opus-4-8`）正文正常返回，但**没有 thinking block**；而老模型（opus-4-7、sonnet-4-6 等）thinking 正常。日志里没有任何报错。
+
+**原因：** 镜像是 pin 死的（`v1.83.14`）且设了 `LITELLM_LOCAL_MODEL_COST_MAP=True`，所以 LiteLLM 只认识打包进**那个镜像**的成本表里的模型。比镜像更新的模型不在表里 → `get_model_info` 抛 "not mapped yet" → `supports_reasoning=False`。再叠加 `drop_params: true`，LiteLLM 会**静默删掉** thinking/reasoning 参数——于是模型只返回正文，没有 thinking，且不报错、日志里也看不出（`set_verbose: false` 不记请求体）。
+
+这是结构性问题，不是某个模型独有：**任何比 pin 镜像更新的模型都会中招**。已经在成本表里的模型（opus-4-7、sonnet-4-6…）自带 `supports_reasoning=True`，不受影响。
+
+**修复（不升级镜像）：** 在该模型的 `model_info` 里加 `supports_reasoning: true`，覆盖缺失的成本表条目，然后重新部署：
+
+```yaml
+  - model_name: claude-opus-4-8
+    litellm_params:
+      model: bedrock/global.anthropic.claude-opus-4-8
+      aws_region_name: __BEDROCK_REGION__
+    model_info:
+      supports_reasoning: true   # 覆盖镜像成本表里缺失的条目
+      input_cost_per_token: 0.000005
+      # ...
+```
+
+镜像升级到收录了该模型的版本后即可移除此 override（opus-4-8 在 litellm ≥ v1.88.0 才进成本表）。验证要走**完整 proxy 链路**，别只看文件：
+
+```bash
+kubectl exec -n litellm deploy/litellm -c litellm -- python -c 'import os,json,urllib.request; \
+  r=urllib.request.urlopen(urllib.request.Request("http://localhost:4000/v1/chat/completions", \
+  data=json.dumps({"model":"claude-opus-4-8","messages":[{"role":"user","content":"2+2? think"}],"max_tokens":1024,"thinking":{"type":"adaptive"}}).encode(), \
+  headers={"Authorization":"Bearer "+os.environ["LITELLM_MASTER_KEY"],"Content-Type":"application/json"})); \
+  print(bool(json.loads(r.read())["choices"][0]["message"].get("thinking_blocks")))'
+# True = thinking block 正常返回
+```
