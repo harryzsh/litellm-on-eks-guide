@@ -151,7 +151,7 @@ kubectl exec -n litellm deploy/litellm -c litellm -- python -c 'import os,json,u
 
 ### 13.6 客户端发了 Claude 不支持的参数 → 400
 
-**现象：** 一些客户端 / SDK（如 OpenAI、OpenRouter、Qwen 风格）发来的请求会 400,报错类似:
+**现象：** 一些客户端 / SDK 发来的请求会 400,报错类似:
 
 - `enable_thinking: Extra inputs are not permitted`
 - `provider: Extra inputs are not permitted`
@@ -160,7 +160,7 @@ kubectl exec -n litellm deploy/litellm -c litellm -- python -c 'import os,json,u
 
 **原因:**
 
-1. **`enable_thinking`**(Qwen 风格)、**`provider`**(OpenRouter 风格)等字段**不是** Anthropic/Bedrock 的标准参数。`drop_params: true` 只丢弃"它认识、但目标模型不支持"的标准 OpenAI 参数,对这种**不认识的非标准字段**会原样透传 → Bedrock 严格校验直接拒收。
+1. **`enable_thinking`**、**`provider`** 等字段**不是** Anthropic/Bedrock 的标准参数。`drop_params: true` 只丢弃"它认识、但目标模型不支持"的标准参数,对这种**不认识的非标准字段**会原样透传 → Bedrock 严格校验直接拒收。
 2. **`temperature` / `top_p`** 单独发都没问题(litellm 会按需丢弃),但**两个同时出现**会 400:opus-4-7/4-8 上采样参数已废弃,4-6/sonnet/haiku 则不允许两者并存。
 
 **修复(服务端兜底,客户不用改):** 在模型的 `litellm_params` 里加 `additional_drop_params`,主动剥掉这些字段。注意要 **per-model**——`litellm_settings` 层的 `additional_drop_params` 在 bedrock 路径上不生效(本镜像版本)。
