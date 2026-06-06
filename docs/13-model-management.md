@@ -147,3 +147,44 @@ kubectl exec -n litellm deploy/litellm -c litellm -- python -c 'import os,json,u
   print(bool(json.loads(r.read())["choices"][0]["message"].get("thinking_blocks")))'
 # True = thinking block 正常返回
 ```
+
+
+### 13.6 客户端发了 Claude 不支持的参数 → 400
+
+**现象：** 一些客户端 / SDK 发来的请求会 400,报错类似:
+
+- `enable_thinking: Extra inputs are not permitted`
+- `provider: Extra inputs are not permitted`
+- `` `temperature` is deprecated for this model `` (opus-4-7/4-8)
+- `` `temperature` and `top_p` cannot both be specified `` (opus-4-6 / sonnet / haiku)
+
+**原因:**
+
+1. **`enable_thinking`**、**`provider`** 等字段**不是** Anthropic/Bedrock 的标准参数。`drop_params: true` 只丢弃"它认识、但目标模型不支持"的标准参数,对这种**不认识的非标准字段**会原样透传 → Bedrock 严格校验直接拒收。
+2. **`temperature` / `top_p`** 单独发都没问题(litellm 会按需丢弃),但**两个同时出现**会 400:opus-4-7/4-8 上采样参数已废弃,4-6/sonnet/haiku 则不允许两者并存。
+
+**修复(服务端兜底,客户不用改):** 在模型的 `litellm_params` 里加 `additional_drop_params`,主动剥掉这些字段。注意要 **per-model**——`litellm_settings` 层的 `additional_drop_params` 在 bedrock 路径上不生效(本镜像版本)。
+
+按模型分两档,避免误伤真正在用 temperature 的客户:
+
+```yaml
+  # opus-4-7 / 4-8:采样参数已废弃,temp/top_p 一并 drop
+  - model_name: claude-opus-4-8
+    litellm_params:
+      model: bedrock/global.anthropic.claude-opus-4-8
+      aws_region_name: __BEDROCK_REGION__
+      drop_params: true
+      additional_drop_params: ["enable_thinking", "provider", "frequency_penalty", "presence_penalty", "temperature", "top_p"]
+    # ...
+
+  # opus-4-6 / sonnet-4-6 / haiku-4-5:支持 temperature,只 drop 非标准字段
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: bedrock/global.anthropic.claude-sonnet-4-6
+      aws_region_name: __BEDROCK_REGION__
+      drop_params: true
+      additional_drop_params: ["enable_thinking", "provider", "frequency_penalty", "presence_penalty"]
+    # ...
+```
+
+> 注意:对支持 temperature 的模型(4-6/sonnet/haiku)**不要** drop `temperature`/`top_p`,否则会静默吞掉正常客户的采样设置。它们的 `temperature+top_p` 组合 400 属于客户端发了非法组合,应让客户端二选一,而非服务端兜底。`enable_thinking` / `provider` 这类非标准字段才适合全系列 drop。
