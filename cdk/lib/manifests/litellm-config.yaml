@@ -17,15 +17,16 @@ model_list:
       aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID_1
       aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
       aws_region_name: __BEDROCK_REGION__
-      # Strip params Bedrock rejects. enable_thinking is a non-Anthropic
-      # (Qwen-style) field litellm forwards verbatim -> 400 "Extra inputs not
-      # permitted". freq/presence_penalty unsupported by Claude. temperature+top_p
+      # Strip params Bedrock rejects. enable_thinking and provider are
+      # non-standard fields some clients send; litellm forwards unknown extras
+      # verbatim -> 400 "Extra inputs not permitted". freq/presence_penalty
+      # unsupported by Claude. temperature+top_p
       # together -> 400 on opus-4-7/4-8 (sampling params deprecated), so drop both
       # here; they are KEPT on 4-6/sonnet/haiku where they still work. Per-model
       # because litellm_settings.additional_drop_params is ignored on the bedrock
       # path in this image version.
       drop_params: true
-      additional_drop_params: ["enable_thinking", "frequency_penalty", "presence_penalty", "temperature", "top_p"]
+      additional_drop_params: ["enable_thinking", "provider", "frequency_penalty", "presence_penalty", "temperature", "top_p"]
     model_info:
       # opus-4-8 isn't in this image's (v1.83.14) bundled cost map, so litellm
       # defaults supports_reasoning=False and drop_params silently strips the
@@ -46,7 +47,7 @@ model_list:
       aws_region_name: __BEDROCK_REGION__
       # See opus-4-8 note. temperature+top_p dropped here too (deprecated on 4.7).
       drop_params: true
-      additional_drop_params: ["enable_thinking", "frequency_penalty", "presence_penalty", "temperature", "top_p"]
+      additional_drop_params: ["enable_thinking", "provider", "frequency_penalty", "presence_penalty", "temperature", "top_p"]
     model_info:
       input_cost_per_token: 0.000005
       output_cost_per_token: 0.000025
@@ -64,7 +65,7 @@ model_list:
       # Drop only non-Anthropic wild fields. temperature/top_p ARE supported on
       # 4.6 — keep them so clients that legitimately set temperature work.
       drop_params: true
-      additional_drop_params: ["enable_thinking", "frequency_penalty", "presence_penalty"]
+      additional_drop_params: ["enable_thinking", "provider", "frequency_penalty", "presence_penalty"]
     model_info:
       input_cost_per_token: 0.000005
       output_cost_per_token: 0.000025
@@ -80,7 +81,7 @@ model_list:
       aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
       aws_region_name: __BEDROCK_REGION__
       drop_params: true
-      additional_drop_params: ["enable_thinking", "frequency_penalty", "presence_penalty"]
+      additional_drop_params: ["enable_thinking", "provider", "frequency_penalty", "presence_penalty"]
     model_info:
       max_input_tokens: 1000000
       input_cost_per_token: 0.000003
@@ -97,7 +98,7 @@ model_list:
       aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY_1
       aws_region_name: __BEDROCK_REGION__
       drop_params: true
-      additional_drop_params: ["enable_thinking", "frequency_penalty", "presence_penalty"]
+      additional_drop_params: ["enable_thinking", "provider", "frequency_penalty", "presence_penalty"]
     model_info:
       input_cost_per_token: 0.000001
       output_cost_per_token: 0.000005
