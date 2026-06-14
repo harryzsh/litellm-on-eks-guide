@@ -641,6 +641,22 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
   });
   configMap.node.addDependency(namespace);
 
+  // 4b. ConfigMap (bedrock_mantle Responses API sitecustomize monkey-patch)
+  //     Injects GPT-5.5/5.4 (responses-only on Bedrock) support into litellm
+  //     at interpreter startup via PYTHONPATH=/opt/inject, without modifying
+  //     the official image. Remove once litellm ships native support.
+  const sitecustomizePy = fs.readFileSync(
+    path.join(__dirname, 'manifests', 'bedrock-mantle-sitecustomize.py'),
+    'utf8',
+  );
+  const mantlePatchConfigMap = cluster.addManifest('LitellmBedrockMantlePatch', {
+    apiVersion: 'v1',
+    kind: 'ConfigMap',
+    metadata: { name: 'litellm-bedrock-mantle-patch', namespace: ns },
+    data: { 'sitecustomize.py': sitecustomizePy },
+  });
+  mantlePatchConfigMap.node.addDependency(namespace);
+
   // 5. Service
   const service = cluster.addManifest('LitellmService', {
     apiVersion: 'v1',
@@ -716,6 +732,9 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
                 { name: 'LITELLM_LOG', value: 'ERROR' },
                 { name: 'LITELLM_LOCAL_MODEL_COST_MAP', value: 'True' },
                 { name: 'MAX_REQUESTS_BEFORE_RESTART', value: '10000' },
+                // Load /opt/inject/sitecustomize.py at interpreter startup to
+                // inject bedrock_mantle Responses API support (GPT-5.5/5.4).
+                { name: 'PYTHONPATH', value: '/opt/inject' },
               ],
               resources: {
                 requests: { cpu: '200m', memory: '5Gi' },
@@ -748,15 +767,27 @@ function addLitellmManifests(scope: Construct, cluster: eks.Cluster, props: Mani
                   subPath: 'config.yaml',
                   readOnly: true,
                 },
+                {
+                  name: 'bedrock-mantle-patch',
+                  mountPath: '/opt/inject',
+                  readOnly: true,
+                },
               ],
             },
           ],
-          volumes: [{ name: 'config', configMap: { name: 'litellm-config' } }],
+          volumes: [
+            { name: 'config', configMap: { name: 'litellm-config' } },
+            {
+              name: 'bedrock-mantle-patch',
+              configMap: { name: 'litellm-bedrock-mantle-patch' },
+            },
+          ],
         },
       },
     },
   });
   deployment.node.addDependency(configMap);
+  deployment.node.addDependency(mantlePatchConfigMap);
   deployment.node.addDependency(externalSecret);
 
   // 7. Ingress (internal ALB)

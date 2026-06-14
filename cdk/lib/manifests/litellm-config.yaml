@@ -106,6 +106,44 @@ model_list:
       cache_creation_input_token_cost: 0.00000125
       cache_creation_input_token_cost_above_1hr: 0.000002
 
+  # ==== OpenAI GPT-5.5 / 5.4 (Bedrock Mantle, Responses API) ====
+  # OpenAI frontier models on Bedrock are served ONLY at the
+  # /openai/v1/responses path on the bedrock-mantle endpoint, and ONLY in
+  # regions where they are available (us-east-2 at launch). They use a
+  # Bedrock API key (bearer token) rather than SigV4 AKSK.
+  #
+  # litellm's bedrock_mantle provider does NOT register a Responses API config,
+  # so these requests get downgraded to chat/completions transformation and
+  # fail (functools.partial 'acompletion' error + protocol mismatch). A
+  # runtime sitecustomize monkey-patch registers a BedrockMantleResponsesConfig
+  # so requests pass through natively. See the bedrock-mantle responses guide
+  # and the sitecustomize ConfigMap mounted at /opt/inject.
+  - model_name: gpt-5.5
+    litellm_params:
+      model: bedrock_mantle/openai.gpt-5.5
+      api_key: os.environ/BEDROCK_MANTLE_API_KEY
+      api_base: "https://bedrock-mantle.us-east-2.api.aws/v1"
+    model_info:
+      mode: responses
+      supports_reasoning: true
+      max_input_tokens: 272000
+      max_output_tokens: 128000
+      input_cost_per_token: 0.0000055    # $5.50 / 1M (AWS Bedrock official)
+      output_cost_per_token: 0.000033    # $33.00 / 1M
+
+  - model_name: gpt-5.4
+    litellm_params:
+      model: bedrock_mantle/openai.gpt-5.4
+      api_key: os.environ/BEDROCK_MANTLE_API_KEY
+      api_base: "https://bedrock-mantle.us-east-2.api.aws/v1"
+    model_info:
+      mode: responses
+      supports_reasoning: true
+      max_input_tokens: 272000
+      max_output_tokens: 128000
+      input_cost_per_token: 0.00000275   # $2.75 / 1M (AWS Bedrock official)
+      output_cost_per_token: 0.0000165   # $16.50 / 1M
+
 router_settings:
   routing_strategy: simple-shuffle
   redis_host: os.environ/REDIS_HOST

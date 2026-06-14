@@ -65,6 +65,8 @@ LiteLLM Pod × N（EKS namespace: litellm）
 | 16 | [Budget 管控与速率限制](docs/16-budget-rate-limit.md) | Budget、RPM、TPM 三层模型、Reset 时区 |
 | 17 | [完整验收流程](docs/17-acceptance.md) | 从 Step 1 到 Step 10 的完整验收清单 |
 | 18 | [运维与已知问题](docs/18-operations.md) | 升级、已知问题与 hotfix |
+| 19 | [Karpenter 节点供给](docs/19-karpenter.md) | Karpenter NodePool、实例选型、容量规划 |
+| 20 | [OpenAI GPT-5.5/5.4（Bedrock Mantle）](docs/20-openai-gpt5-bedrock-mantle.md) | GPT-5.x Responses API 接入、sitecustomize 注入补丁 |
 
 
 ## 使用方式
